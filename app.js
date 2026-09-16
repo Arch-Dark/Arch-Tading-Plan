@@ -1,28 +1,27 @@
-"use strict";
-
 /* ============================================================
-   ARCH TRADING PLAN
-   APP.JS — LOGIQUE PRINCIPALE
+   ARCH TRADING PLAN — APP.JS
+   Moteur principal
    ============================================================ */
 
+"use strict";
 
 /* ============================================================
    CONFIGURATION
    ============================================================ */
 
-const TRADES_KEY = "tradingTrades";
-const CAPITAL_KEY = "tradingActiveCapital";
-const ARCHIVES_KEY = "tradingCapitalArchives";
-const THEME_KEY = "tradingDashboardTheme";
+const STORAGE_KEYS = {
+    trades: "tradingTrades",
+    activeCapital: "tradingActiveCapital",
+    archives: "tradingCapitalArchives",
+    theme: "tradingDashboardTheme"
+};
 
-const MIN_RR = 2;
+const MIN_RR = 2.00;
 const MIN_LOT = 0.01;
 const LOT_STEP = 0.01;
-
 const RISK_TOLERANCE = 0.10;
 
-const MADAGASCAR_TIMEZONE = "Indian/Antananarivo";
-
+const ACCOUNT_CURRENCY = "USD";
 
 const ASSETS = [
     "EUR/USD",
@@ -35,7 +34,6 @@ const ASSETS = [
     "XAUUSD",
     "BTCUSD"
 ];
-
 
 const SETUPS = [
     "LDP+QML",
@@ -51,23 +49,10 @@ const SETUPS = [
     "SBM3"
 ];
 
-
-/* ============================================================
-   ÉTAT
-   ============================================================ */
-
-let trades = [];
-let archives = [];
-let activeCapital = null;
-
-let currentAnalysisPeriod = "today";
-let currentPerformancePeriod = "today";
-
-let currentCapitalModalMode = "new";
-
 let calendarMonth = new Date().getMonth();
 let calendarYear = new Date().getFullYear();
 
+let currentAnalysisTrades = [];
 let capitalChartInstance = null;
 let archiveChartInstance = null;
 
@@ -76,60 +61,11 @@ let archiveChartInstance = null;
    UTILITAIRES
    ============================================================ */
 
-function parseNumber(value) {
-
-    if (
-        value === null ||
-        value === undefined ||
-        value === ""
-    ) {
-        return NaN;
-    }
-
-    return Number(
-        String(value).replace(",", ".")
-    );
+function $(id) {
+    return document.getElementById(id);
 }
 
-
-function formatMoney(value) {
-
-    const number = Number(value) || 0;
-
-    return "$" + number.toFixed(2);
-}
-
-
-function money(value) {
-    return formatMoney(value);
-}
-
-
-function formatNumber(value, decimals = 2) {
-
-    const number = Number(value);
-
-    if (!Number.isFinite(number)) {
-        return "-";
-    }
-
-    return number.toFixed(decimals);
-}
-
-
-function generateId() {
-
-    return (
-        Date.now().toString(36) +
-        Math.random()
-            .toString(36)
-            .slice(2)
-    );
-}
-
-
-function escapeHtml(value) {
-
+function escapeValue(value) {
     return String(value ?? "")
         .replace(/&/g, "&amp;")
         .replace(/</g, "&lt;")
@@ -138,307 +74,946 @@ function escapeHtml(value) {
         .replace(/'/g, "&#039;");
 }
 
-
-function escapeValue(value) {
-    return escapeHtml(value);
+function clamp(value, min, max) {
+    return Math.min(Math.max(value, min), max);
 }
 
+function round(value, decimals = 2) {
+    const factor = Math.pow(10, decimals);
+    return Math.round((Number(value) + Number.EPSILON) * factor) / factor;
+}
+
+function roundToStep(value, step = LOT_STEP) {
+    if (!Number.isFinite(Number(value))) return 0;
+
+    return Math.floor(
+        (Number(value) + Number.EPSILON) / step
+    ) * step;
+}
+
+function formatMoney(value) {
+    const number = Number(value) || 0;
+
+    return new Intl.NumberFormat("fr-FR", {
+        minimumFractionDigits: 2,
+        maximumFractionDigits: 2
+    }).format(number) + " $";
+}
+
+function formatNumber(value, decimals = 2) {
+    const number = Number(value);
+
+    if (!Number.isFinite(number)) return "—";
+
+    return new Intl.NumberFormat("fr-FR", {
+        minimumFractionDigits: decimals,
+        maximumFractionDigits: decimals
+    }).format(number);
+}
+
+function formatPercent(value, decimals = 1) {
+    const number = Number(value);
+
+    if (!Number.isFinite(number)) return "—";
+
+    return number.toFixed(decimals) + " %";
+}
 
 function getTodayDate() {
+    const now = new Date();
 
-    return new Intl.DateTimeFormat(
-        "en-CA",
-        {
-            timeZone: MADAGASCAR_TIMEZONE
-        }
-    ).format(new Date());
+    const year = now.getFullYear();
+    const month = String(now.getMonth() + 1).padStart(2, "0");
+    const day = String(now.getDate()).padStart(2, "0");
+
+    return `${year}-${month}-${day}`;
 }
 
+function getNowISO() {
+    return new Date().toISOString();
+}
 
-function formatStoredDateTime(value) {
-
-    if (!value) {
-        return "-";
-    }
-
-    const date = new Date(value);
-
-    if (Number.isNaN(date.getTime())) {
-        return "-";
-    }
-
-    return new Intl.DateTimeFormat(
-        "fr-FR",
-        {
-            timeZone: MADAGASCAR_TIMEZONE,
-            year: "numeric",
-            month: "2-digit",
-            day: "2-digit",
-            hour: "2-digit",
-            minute: "2-digit"
-        }
-    ).format(date);
+function isFiniteNumber(value) {
+    return Number.isFinite(Number(value));
 }
 
 
 /* ============================================================
-   STOCKAGE
+   STOCKAGE LOCAL
    ============================================================ */
 
-function saveTrades() {
+function loadTrades() {
+    try {
+        const data = JSON.parse(
+            localStorage.getItem(STORAGE_KEYS.trades) || "[]"
+        );
 
+        return Array.isArray(data) ? data : [];
+    } catch (error) {
+        console.error("Erreur chargement trades :", error);
+        return [];
+    }
+}
+
+function saveTrades(trades) {
     localStorage.setItem(
-        TRADES_KEY,
+        STORAGE_KEYS.trades,
         JSON.stringify(trades)
     );
 }
 
+function loadActiveCapital() {
+    try {
+        return JSON.parse(
+            localStorage.getItem(STORAGE_KEYS.activeCapital) || "null"
+        );
+    } catch (error) {
+        console.error("Erreur capital actif :", error);
+        return null;
+    }
+}
 
-function saveArchives() {
-
+function saveActiveCapital(capital) {
     localStorage.setItem(
-        ARCHIVES_KEY,
+        STORAGE_KEYS.activeCapital,
+        JSON.stringify(capital)
+    );
+}
+
+function loadArchives() {
+    try {
+        const data = JSON.parse(
+            localStorage.getItem(STORAGE_KEYS.archives) || "[]"
+        );
+
+        return Array.isArray(data) ? data : [];
+    } catch (error) {
+        console.error("Erreur archives :", error);
+        return [];
+    }
+}
+
+function saveArchives(archives) {
+    localStorage.setItem(
+        STORAGE_KEYS.archives,
         JSON.stringify(archives)
     );
 }
 
 
-function saveActiveCapital() {
+/* ============================================================
+   MOTEUR DES SYMBOLES
+   ============================================================ */
 
-    localStorage.setItem(
-        CAPITAL_KEY,
-        JSON.stringify(activeCapital)
-    );
-}
+/*
+    Important :
 
+    Forex classique :
+        1 pip = 0.0001
 
-function loadData() {
+    JPY :
+        1 pip = 0.01
 
-    try {
-        trades =
-            JSON.parse(
-                localStorage.getItem(TRADES_KEY)
-            ) || [];
-    } catch {
-        trades = [];
-    }
+    XAUUSD :
+        contrat standard = 100 oz
+        mouvement de prix = directement en USD
 
+    BTCUSD :
+        contrat simplifié pour le journal :
+        1 unité de BTC par 1 lot
 
-    try {
-        archives =
-            JSON.parse(
-                localStorage.getItem(ARCHIVES_KEY)
-            ) || [];
-    } catch {
-        archives = [];
-    }
+    Le moteur pourra être adapté si le broker utilise
+    une taille de contrat différente.
+*/
 
+function getSymbolSpecs(asset) {
 
-    try {
-        activeCapital =
-            JSON.parse(
-                localStorage.getItem(CAPITAL_KEY)
-            );
-    } catch {
-        activeCapital = null;
-    }
+    const symbol = String(asset || "").toUpperCase();
 
-
-    if (!Array.isArray(trades)) {
-        trades = [];
-    }
-
-    if (!Array.isArray(archives)) {
-        archives = [];
-    }
-
-
-    /*
-       Migration des anciens trades.
-    */
-
-    trades = trades.map(trade => {
-
+    if (symbol === "XAUUSD") {
         return {
-            ...trade,
-
-            id:
-                trade.id ||
-                generateId(),
-
-            pnl:
-                Number(trade.pnl) || 0,
-
-            capitalId:
-                trade.capitalId ||
-                activeCapital?.id ||
-                null
+            type: "gold",
+            pipSize: 0.01,
+            contractSize: 100,
+            quoteCurrency: "USD"
         };
-    });
+    }
+
+    if (symbol === "BTCUSD") {
+        return {
+            type: "crypto",
+            pipSize: 0.01,
+            contractSize: 1,
+            quoteCurrency: "USD"
+        };
+    }
+
+    if (symbol.endsWith("/JPY") || symbol === "USDJPY") {
+        return {
+            type: "forex-jpy",
+            pipSize: 0.01,
+            contractSize: 100000,
+            quoteCurrency: "JPY"
+        };
+    }
+
+    return {
+        type: "forex",
+        pipSize: 0.0001,
+        contractSize: 100000,
+        quoteCurrency: "USD"
+    };
 }
 
 
 /* ============================================================
-   CAPITAL
+   DIRECTION
    ============================================================ */
 
-function getCapitalRisk(capital = activeCapital) {
-
-    const value = Number(
-        capital?.riskReference ??
-        capital?.riskPerTrade ??
-        0
-    );
-
-    return Number.isFinite(value) && value > 0
-        ? value
-        : 0;
+function getDirectionMultiplier(direction) {
+    return String(direction).toUpperCase() === "SELL"
+        ? -1
+        : 1;
 }
 
 
-function getCapitalRR(capital = activeCapital) {
+/* ============================================================
+   DISTANCE SL
+   ============================================================ */
 
-    const value = Number(
-        capital?.rrTarget ??
-        capital?.rr ??
-        MIN_RR
-    );
+function getTradeRiskDistance(trade) {
 
-    return Number.isFinite(value) && value >= MIN_RR
-        ? value
-        : MIN_RR;
-}
+    const entry = Number(trade.entry);
+    const sl = Number(trade.sl);
 
-
-function getCapitalObjective(capital = activeCapital) {
-
-    return (
-        getCapitalRisk(capital) *
-        getCapitalRR(capital)
-    );
-}
-
-
-function getCapitalTrades(capitalId) {
-
-    return trades.filter(
-        trade =>
-            trade.capitalId === capitalId
-    );
-}
-
-
-function getActiveCapitalTrades() {
-
-    if (!activeCapital) {
-        return [];
+    if (!Number.isFinite(entry) || !Number.isFinite(sl)) {
+        return null;
     }
 
-    return getCapitalTrades(
-        activeCapital.id
+    return Math.abs(entry - sl);
+}
+
+
+/* ============================================================
+   PIPS
+   ============================================================ */
+
+function calculatePipsFromDistance(distance, asset) {
+
+    const specs = getSymbolSpecs(asset);
+
+    if (!Number.isFinite(Number(distance)) || distance < 0) {
+        return null;
+    }
+
+    return Number(distance) / specs.pipSize;
+}
+
+function calculatePips(entry, exit, asset) {
+
+    const e = Number(entry);
+    const x = Number(exit);
+
+    if (!Number.isFinite(e) || !Number.isFinite(x)) {
+        return null;
+    }
+
+    return calculatePipsFromDistance(
+        Math.abs(e - x),
+        asset
     );
 }
 
 
-function calculateProfit(tradeList) {
+/* ============================================================
+   TAUX DE CONVERSION POUR LES PAIRES JPY
+   ============================================================ */
 
-    return tradeList.reduce(
-        (sum, trade) =>
-            sum + (Number(trade.pnl) || 0),
-        0
-    );
+/*
+    Pour USDJPY avec compte USD :
+
+    pipValue = (pipSize / USDJPY) × contractSize
+
+    Exemple :
+    USDJPY = 150
+    pipSize = 0.01
+    contract = 100000
+
+    = (0.01 / 150) × 100000
+    = 6.6667 USD/pip/lot
+*/
+
+function getConversionRateForPip(asset, entryPrice) {
+
+    const symbol = String(asset || "").toUpperCase();
+
+    /*
+        USDJPY :
+        le prix lui-même est USDJPY.
+    */
+    if (symbol === "USD/JPY" || symbol === "USDJPY") {
+        return Number(entryPrice);
+    }
+
+    /*
+        Pour les futures paires JPY comme EURJPY ou GBPJPY,
+        le calcul exact en USD nécessite le taux de conversion
+        de la devise de base vers USD.
+
+        Pour notre liste actuelle, USDJPY est la seule paire JPY.
+    */
+
+    return Number(entryPrice);
 }
 
 
-function calculateCurrentBalance() {
+/* ============================================================
+   VALEUR DU PIP
+   ============================================================ */
 
-    if (!activeCapital) {
+function calculatePipValuePerLot(asset, price) {
+
+    const specs = getSymbolSpecs(asset);
+
+    const currentPrice = Number(price);
+
+    if (!Number.isFinite(currentPrice) || currentPrice <= 0) {
+        return null;
+    }
+
+    /*
+        FOREX CLASSIQUE
+
+        Pour les paires où la devise cotée est USD :
+
+        1 pip × 100000 unités
+        = 10 USD
+    */
+
+    if (specs.type === "forex") {
+
+        return specs.pipSize * specs.contractSize;
+    }
+
+    /*
+        USDJPY
+
+        Valeur pip en USD :
+        pipSize / USDJPY × contractSize
+    */
+
+    if (specs.type === "forex-jpy") {
+
+        const conversionRate =
+            getConversionRateForPip(asset, currentPrice);
+
+        if (
+            !Number.isFinite(conversionRate) ||
+            conversionRate <= 0
+        ) {
+            return null;
+        }
+
+        return (
+            specs.pipSize *
+            specs.contractSize /
+            conversionRate
+        );
+    }
+
+    /*
+        XAUUSD
+
+        0.01 USD × 100 oz
+        = 1 USD par pip à 1 lot
+    */
+
+    if (specs.type === "gold") {
+
+        return specs.pipSize * specs.contractSize;
+    }
+
+    /*
+        BTCUSD
+
+        0.01 × 1 unité
+        = 0.01 USD par "pip" à 1 lot
+    */
+
+    if (specs.type === "crypto") {
+
+        return specs.pipSize * specs.contractSize;
+    }
+
+    return null;
+}
+
+
+/* ============================================================
+   PERTE AU SL POUR 1 LOT
+   ============================================================ */
+
+function calculateLossAtSLForOneLot(
+    asset,
+    entry,
+    sl
+) {
+
+    const distance = Math.abs(
+        Number(entry) - Number(sl)
+    );
+
+    if (!Number.isFinite(distance)) {
+        return null;
+    }
+
+    const specs = getSymbolSpecs(asset);
+
+    /*
+        XAUUSD :
+
+        distance × lot × contractSize
+    */
+
+    if (specs.type === "gold") {
+
+        return distance * specs.contractSize;
+    }
+
+    /*
+        BTCUSD
+    */
+
+    if (specs.type === "crypto") {
+
+        return distance * specs.contractSize;
+    }
+
+    /*
+        FOREX :
+
+        distance en pips × valeur pip
+    */
+
+    const pips = calculatePipsFromDistance(
+        distance,
+        asset
+    );
+
+    const pipValue = calculatePipValuePerLot(
+        asset,
+        entry
+    );
+
+    if (
+        !Number.isFinite(pips) ||
+        !Number.isFinite(pipValue)
+    ) {
+        return null;
+    }
+
+    return pips * pipValue;
+}
+
+
+/* ============================================================
+   RISQUE EN ARGENT
+   ============================================================ */
+
+function calculateRiskMoney(capital, riskPercent) {
+
+    const c = Number(capital);
+    const r = Number(riskPercent);
+
+    if (
+        !Number.isFinite(c) ||
+        !Number.isFinite(r) ||
+        c <= 0 ||
+        r < 0
+    ) {
         return 0;
     }
 
+    return c * (r / 100);
+}
+
+
+/* ============================================================
+   LOT AUTOMATIQUE
+   ============================================================ */
+
+function calculateLotFromRisk(
+    capital,
+    riskPercent,
+    asset,
+    entry,
+    sl
+) {
+
+    const riskMoney = calculateRiskMoney(
+        capital,
+        riskPercent
+    );
+
+    if (riskMoney <= 0) {
+        return 0;
+    }
+
+    const lossAtSLForOneLot =
+        calculateLossAtSLForOneLot(
+            asset,
+            entry,
+            sl
+        );
+
+    if (
+        !Number.isFinite(lossAtSLForOneLot) ||
+        lossAtSLForOneLot <= 0
+    ) {
+        return 0;
+    }
+
+    /*
+        FORMULE CENTRALE :
+
+        Lot =
+        Risque autorisé /
+        Perte au SL pour 1 lot
+    */
+
+    let lot =
+        riskMoney /
+        lossAtSLForOneLot;
+
+    /*
+        Respect du pas de lot.
+    */
+
+    lot = roundToStep(
+        lot,
+        LOT_STEP
+    );
+
+    /*
+        Ne jamais dépasser le risque demandé.
+        On ne force donc pas 0.01 si le risque est
+        inférieur à ce que représente 0.01 lot.
+    */
+
+    if (lot < MIN_LOT) {
+        return 0;
+    }
+
+    return round(lot, 2);
+}
+
+
+/* ============================================================
+   TP SELON LE RR
+   ============================================================ */
+
+function calculateTP(
+    entry,
+    sl,
+    direction,
+    rr
+) {
+
+    const e = Number(entry);
+    const s = Number(sl);
+    const targetRR = Number(rr);
+
+    if (
+        !Number.isFinite(e) ||
+        !Number.isFinite(s) ||
+        !Number.isFinite(targetRR) ||
+        targetRR <= 0
+    ) {
+        return null;
+    }
+
+    const riskDistance = Math.abs(e - s);
+
+    if (riskDistance <= 0) {
+        return null;
+    }
+
+    const multiplier =
+        getDirectionMultiplier(direction);
+
+    /*
+        BUY :
+        TP = Entry + distance SL × RR
+
+        SELL :
+        TP = Entry - distance SL × RR
+    */
+
+    return e +
+        (
+            riskDistance *
+            targetRR *
+            multiplier
+        );
+}
+
+
+/* ============================================================
+   RR RÉEL D'UN TRADE
+   ============================================================ */
+
+function getTradeTargetRR(trade) {
+
+    const entry = Number(trade.entry);
+    const sl = Number(trade.sl);
+    const tp = Number(trade.tp);
+
+    if (
+        !Number.isFinite(entry) ||
+        !Number.isFinite(sl) ||
+        !Number.isFinite(tp)
+    ) {
+        return null;
+    }
+
+    const riskDistance =
+        Math.abs(entry - sl);
+
+    const rewardDistance =
+        Math.abs(tp - entry);
+
+    if (riskDistance <= 0) {
+        return null;
+    }
+
+    return rewardDistance / riskDistance;
+}
+
+
+/* ============================================================
+   P/L
+   ============================================================ */
+
+function calculateTradeProfit(
+    asset,
+    direction,
+    entry,
+    exit,
+    lot
+) {
+
+    const e = Number(entry);
+    const x = Number(exit);
+    const l = Number(lot);
+
+    if (
+        !Number.isFinite(e) ||
+        !Number.isFinite(x) ||
+        !Number.isFinite(l) ||
+        l <= 0
+    ) {
+        return null;
+    }
+
+    const specs = getSymbolSpecs(asset);
+
+    const multiplier =
+        getDirectionMultiplier(direction);
+
+    const priceMovement =
+        (x - e) * multiplier;
+
+    /*
+        XAUUSD :
+
+        P/L =
+        mouvement prix × lot × 100
+    */
+
+    if (specs.type === "gold") {
+
+        return (
+            priceMovement *
+            l *
+            specs.contractSize
+        );
+    }
+
+    /*
+        BTCUSD
+    */
+
+    if (specs.type === "crypto") {
+
+        return (
+            priceMovement *
+            l *
+            specs.contractSize
+        );
+    }
+
+    /*
+        FOREX :
+
+        mouvement en pips × valeur pip × lot
+    */
+
+    const pips =
+        priceMovement /
+        specs.pipSize;
+
+    const pipValue =
+        calculatePipValuePerLot(
+            asset,
+            e
+        );
+
+    if (!Number.isFinite(pipValue)) {
+        return null;
+    }
+
     return (
-        Number(activeCapital.initialCapital) || 0
-    ) +
-    calculateProfit(
-        getActiveCapitalTrades()
+        pips *
+        pipValue *
+        l
     );
 }
 
 
 /* ============================================================
-   CAPITAL — CRÉATION / MODIFICATION
+   CAPITAL ASSOCIÉ AU TRADE
+   ============================================================ */
+
+function getCapitalForTrade(trade) {
+
+    if (
+        trade &&
+        Number.isFinite(Number(trade.capitalAtTrade))
+    ) {
+        return Number(trade.capitalAtTrade);
+    }
+
+    const capital = loadActiveCapital();
+
+    if (!capital) {
+        return 0;
+    }
+
+    return Number(capital.currentBalance) ||
+        Number(capital.initialCapital) ||
+        0;
+}
+
+
+/* ============================================================
+   RÉSULTAT D'UN TRADE
+   ============================================================ */
+
+function normalizeTradeResult(result) {
+
+    const value = String(result || "")
+        .trim()
+        .toUpperCase();
+
+    if (
+        value === "WIN" ||
+        value === "TP" ||
+        value === "GAGNANT"
+    ) {
+        return "WIN";
+    }
+
+    if (
+        value === "LOSS" ||
+        value === "SL" ||
+        value === "PERDANT"
+    ) {
+        return "LOSS";
+    }
+
+    if (
+        value === "BE" ||
+        value === "BREAK EVEN"
+    ) {
+        return "BE";
+    }
+
+    return value;
+}
+
+
+/* ============================================================
+   CALCUL DU TRADE COMPLET
+   ============================================================ */
+
+function calculateTradeData(data) {
+
+    const asset = data.asset;
+    const direction = data.direction;
+    const entry = Number(data.entry);
+    const sl = Number(data.sl);
+    const rr = Number(data.rr);
+
+    const capital = Number(
+        data.capital ||
+        data.capitalAtTrade ||
+        0
+    );
+
+    const riskPercent = Number(
+        data.riskPercent ||
+        0
+    );
+
+    const lot = calculateLotFromRisk(
+        capital,
+        riskPercent,
+        asset,
+        entry,
+        sl
+    );
+
+    const tp = calculateTP(
+        entry,
+        sl,
+        direction,
+        rr
+    );
+
+    const riskMoney =
+        calculateRiskMoney(
+            capital,
+            riskPercent
+        );
+
+    let potentialProfit = null;
+
+    if (
+        Number.isFinite(tp) &&
+        lot > 0
+    ) {
+
+        potentialProfit =
+            calculateTradeProfit(
+                asset,
+                direction,
+                entry,
+                tp,
+                lot
+            );
+    }
+
+    return {
+        lot,
+        tp,
+        riskMoney,
+        potentialProfit
+    };
+}
+
+
+/* ============================================================
+   CAPITAL ACTIF
+   ============================================================ */
+
+function getCurrentBalance() {
+
+    const capital = loadActiveCapital();
+
+    if (!capital) {
+        return 0;
+    }
+
+    return Number(
+        capital.currentBalance ??
+        capital.initialCapital ??
+        0
+    );
+}
+
+function getInitialCapital() {
+
+    const capital = loadActiveCapital();
+
+    if (!capital) {
+        return 0;
+    }
+
+    return Number(
+        capital.initialCapital || 0
+    );
+}
+
+function getCapitalRiskPercent() {
+
+    const capital = loadActiveCapital();
+
+    if (!capital) {
+        return 0;
+    }
+
+    return Number(
+        capital.riskPercent || 0
+    );
+}
+
+function getCapitalRR() {
+
+    const capital = loadActiveCapital();
+
+    if (!capital) {
+        return MIN_RR;
+    }
+
+    return Number(
+        capital.rrTarget || MIN_RR
+    );
+}
+
+
+/* ============================================================
+   MODAL CAPITAL
    ============================================================ */
 
 function openCapitalModal(mode = "new") {
 
-    const modal =
-        document.getElementById("capitalModal");
+    const modal = $("capitalModal");
 
-    if (!modal) {
-        return;
-    }
+    if (!modal) return;
 
-    currentCapitalModalMode = mode;
+    const capital = loadActiveCapital();
 
-    const title =
-        document.getElementById(
-            "capitalModalTitle"
-        );
+    modal.classList.add("show");
+    modal.setAttribute("aria-hidden", "false");
 
-    const nameInput =
-        document.getElementById(
-            "capitalNameInput"
-        );
+    const nameInput = $("capitalNameInput");
+    const amountInput = $("capitalAmountInput");
+    const riskInput = $("capitalRiskInput");
+    const rrInput = $("capitalRRInput");
 
-    const amountInput =
-        document.getElementById(
-            "capitalAmountInput"
-        );
-
-    const riskInput =
-        document.getElementById(
-            "capitalRiskInput"
-        );
-
-    const rrInput =
-        document.getElementById(
-            "capitalRRInput"
-        );
-
-
-    if (mode === "edit" && activeCapital) {
-
-        if (title) {
-            title.textContent =
-                "Modifier le capital";
-        }
+    if (mode === "edit" && capital) {
 
         if (nameInput) {
             nameInput.value =
-                activeCapital.name || "";
+                capital.name || "";
         }
 
         if (amountInput) {
             amountInput.value =
-                activeCapital.initialCapital || "";
+                capital.initialCapital || "";
         }
 
         if (riskInput) {
             riskInput.value =
-                getCapitalRisk(activeCapital);
+                capital.riskPercent || 1;
         }
 
         if (rrInput) {
             rrInput.value =
-                getCapitalRR(activeCapital);
+                capital.rrTarget || MIN_RR;
         }
 
     } else {
-
-        if (title) {
-            title.textContent =
-                "Nouveau capital";
-        }
 
         if (nameInput) {
             nameInput.value = "";
@@ -449,7 +1024,7 @@ function openCapitalModal(mode = "new") {
         }
 
         if (riskInput) {
-            riskInput.value = "";
+            riskInput.value = 1;
         }
 
         if (rrInput) {
@@ -457,184 +1032,116 @@ function openCapitalModal(mode = "new") {
         }
     }
 
-
-    updateCapitalPreview();
-
-    modal.classList.add("show");
-    modal.setAttribute(
-        "aria-hidden",
-        "false"
-    );
+    updateCapitalModalPreview();
 }
-
 
 function closeCapitalModal() {
 
-    const modal =
-        document.getElementById("capitalModal");
+    const modal = $("capitalModal");
 
-    if (!modal) {
-        return;
-    }
+    if (!modal) return;
 
     modal.classList.remove("show");
-
-    modal.setAttribute(
-        "aria-hidden",
-        "true"
-    );
+    modal.setAttribute("aria-hidden", "true");
 }
 
-
-function updateCapitalPreview() {
+function updateCapitalModalPreview() {
 
     const amount =
-        parseNumber(
-            document.getElementById(
-                "capitalAmountInput"
-            )?.value
-        );
+        Number($("capitalAmountInput")?.value || 0);
 
     const risk =
-        parseNumber(
-            document.getElementById(
-                "capitalRiskInput"
-            )?.value
-        );
+        Number($("capitalRiskInput")?.value || 0);
 
     const rr =
-        parseNumber(
-            document.getElementById(
-                "capitalRRInput"
-            )?.value
+        Number($("capitalRRInput")?.value || MIN_RR);
+
+    const riskMoney =
+        calculateRiskMoney(
+            amount,
+            risk
         );
 
+    const objective =
+        riskMoney * rr;
 
-    const riskPreview =
-        document.getElementById(
-            "capitalModalRiskPreview"
-        );
-
-    const rrPreview =
-        document.getElementById(
-            "capitalModalRR"
-        );
-
-    const objectivePreview =
-        document.getElementById(
-            "capitalModalObjective"
-        );
-
-
-    if (riskPreview) {
-        riskPreview.textContent =
-            Number.isFinite(risk)
-                ? formatMoney(risk)
-                : "$0.00";
+    if ($("capitalModalRiskPreview")) {
+        $("capitalModalRiskPreview").textContent =
+            formatMoney(riskMoney);
     }
 
-
-    if (rrPreview) {
-        rrPreview.textContent =
-            Number.isFinite(rr)
-                ? rr.toFixed(2)
-                : MIN_RR.toFixed(2);
+    if ($("capitalModalRR")) {
+        $("capitalModalRR").textContent =
+            rr.toFixed(2);
     }
 
-
-    if (objectivePreview) {
-        objectivePreview.textContent =
-            Number.isFinite(risk) &&
-            Number.isFinite(rr)
-                ? formatMoney(risk * rr)
-                : "$0.00";
+    if ($("capitalModalObjective")) {
+        $("capitalModalObjective").textContent =
+            formatMoney(objective);
     }
 }
 
-
-function saveCapitalFromForm(event) {
-
-    event.preventDefault();
+function saveCapitalFromModal() {
 
     const name =
-        document.getElementById(
-            "capitalNameInput"
-        )?.value.trim();
+        $("capitalNameInput")?.value.trim() ||
+        "Capital principal";
 
     const amount =
-        parseNumber(
-            document.getElementById(
-                "capitalAmountInput"
-            )?.value
+        Number($("capitalAmountInput")?.value || 0);
+
+    const riskPercent =
+        Number($("capitalRiskInput")?.value || 0);
+
+    const rrTarget =
+        Number($("capitalRRInput")?.value || MIN_RR);
+
+    if (amount <= 0) {
+        alert("Veuillez entrer un capital valide.");
+        return;
+    }
+
+    if (riskPercent <= 0) {
+        alert("Veuillez entrer un risque valide.");
+        return;
+    }
+
+    if (rrTarget < MIN_RR) {
+        alert(
+            `Le RR minimum autorisé est ${MIN_RR.toFixed(2)}.`
         );
-
-    const risk =
-        parseNumber(
-            document.getElementById(
-                "capitalRiskInput"
-            )?.value
-        );
-
-    const rr =
-        parseNumber(
-            document.getElementById(
-                "capitalRRInput"
-            )?.value
-        );
-
-
-    if (!name) {
-        alert("Veuillez entrer un nom de capital.");
         return;
     }
 
-    if (!Number.isFinite(amount) || amount <= 0) {
-        alert("Le capital initial doit être supérieur à 0.");
-        return;
-    }
+    const oldCapital = loadActiveCapital();
 
-    if (!Number.isFinite(risk) || risk <= 0) {
-        alert("Le risque par trade doit être supérieur à 0.");
-        return;
-    }
+    const capital = {
+        id: oldCapital?.id ||
+            `capital_${Date.now()}`,
 
-    if (!Number.isFinite(rr) || rr < MIN_RR) {
-        alert("Le RR cible doit être au minimum de 2.00.");
-        return;
-    }
+        name,
 
+        initialCapital:
+            oldCapital?.initialCapital ??
+            amount,
 
-    if (
-        currentCapitalModalMode === "edit" &&
-        activeCapital
-    ) {
+        currentBalance:
+            oldCapital?.currentBalance ??
+            amount,
 
-        activeCapital.name = name;
-        activeCapital.initialCapital = amount;
-        activeCapital.riskReference = risk;
-        activeCapital.rrTarget = rr;
+        riskPercent,
 
-    } else {
+        rrTarget,
 
-        activeCapital = {
+        createdAt:
+            oldCapital?.createdAt ||
+            getNowISO(),
 
-            id: generateId(),
+        updatedAt:
+            getNowISO()
+    };
 
-            name,
-
-            initialCapital: amount,
-
-            riskReference: risk,
-
-            rrTarget: rr,
-
-            createdAt:
-                new Date().toISOString()
-        };
-    }
-
-
-    saveActiveCapital();
+    saveActiveCapital(capital);
 
     closeCapitalModal();
 
@@ -643,692 +1150,75 @@ function saveCapitalFromForm(event) {
 
 
 /* ============================================================
-   ARCHIVES
+   ARCHIVAGE DU CAPITAL
    ============================================================ */
 
-function archiveCurrentCapital() {
+function archiveActiveCapital() {
 
-    if (!activeCapital) {
+    const capital = loadActiveCapital();
+
+    if (!capital) {
         alert("Aucun capital actif à archiver.");
         return;
     }
 
+    const confirmation = confirm(
+        `Archiver le capital "${capital.name}" ?`
+    );
+
+    if (!confirmation) return;
+
+    const trades = loadTrades();
 
     const capitalTrades =
-        getActiveCapitalTrades();
-
-
-    const confirmed =
-        confirm(
-            `Archiver "${activeCapital.name}" ?`
+        trades.filter(
+            trade =>
+                trade.capitalId === capital.id
         );
 
-
-    if (!confirmed) {
-        return;
-    }
-
-
     const archive = {
+        ...capital,
 
-        id: generateId(),
+        archivedAt: getNowISO(),
 
-        name:
-            activeCapital.name,
+        trades: capitalTrades,
 
-        initialCapital:
-            Number(
-                activeCapital.initialCapital
-            ) || 0,
+        finalBalance:
+            Number(capital.currentBalance || 0),
 
-        riskReference:
-            getCapitalRisk(activeCapital),
-
-        rrTarget:
-            getCapitalRR(activeCapital),
-
-        createdAt:
-            activeCapital.createdAt,
-
-        archivedAt:
-            new Date().toISOString(),
-
-        trades:
-            [...capitalTrades]
+        profit:
+            Number(capital.currentBalance || 0) -
+            Number(capital.initialCapital || 0)
     };
 
+    const archives = loadArchives();
 
     archives.unshift(archive);
 
+    saveArchives(archives);
 
-    trades =
-        trades.filter(
-            trade =>
-                trade.capitalId !==
-                activeCapital.id
-        );
-
-
-    activeCapital = null;
-
-
-    saveArchives();
-    saveTrades();
-    saveActiveCapital();
-
+    localStorage.removeItem(
+        STORAGE_KEYS.activeCapital
+    );
 
     renderAll();
 }
 
+function deleteArchive(index) {
 
-function deleteArchive(id) {
+    const archives = loadArchives();
 
-    const archive =
-        archives.find(
-            item => item.id === id
-        );
+    if (!archives[index]) return;
 
-    if (!archive) {
+    if (!confirm("Supprimer cette archive ?")) {
         return;
     }
 
+    archives.splice(index, 1);
 
-    if (
-        !confirm(
-            `Supprimer définitivement l'archive "${archive.name}" ?`
-        )
-    ) {
-        return;
-    }
-
-
-    archives =
-        archives.filter(
-            item => item.id !== id
-        );
-
-
-    saveArchives();
+    saveArchives(archives);
 
     renderArchives();
-}
-
-
-function openArchiveChart(id) {
-
-    const archive =
-        archives.find(
-            item => item.id === id
-        );
-
-    if (!archive) {
-        return;
-    }
-
-
-    const modal =
-        document.getElementById(
-            "archiveChartModal"
-        );
-
-    if (!modal) {
-        return;
-    }
-
-
-    const title =
-        document.getElementById(
-            "archiveChartTitle"
-        );
-
-    const subtitle =
-        document.getElementById(
-            "archiveChartSubtitle"
-        );
-
-    const initial =
-        document.getElementById(
-            "archiveChartInitial"
-        );
-
-    const final =
-        document.getElementById(
-            "archiveChartFinal"
-        );
-
-    const profit =
-        document.getElementById(
-            "archiveChartProfit"
-        );
-
-
-    const archiveTrades =
-        Array.isArray(archive.trades)
-            ? archive.trades
-            : [];
-
-
-    const totalProfit =
-        calculateProfit(
-            archiveTrades
-        );
-
-
-    const finalBalance =
-        Number(
-            archive.initialCapital
-        ) + totalProfit;
-
-
-    if (title) {
-        title.textContent =
-            archive.name;
-    }
-
-    if (subtitle) {
-        subtitle.textContent =
-            `Archivé le ${formatStoredDateTime(
-                archive.archivedAt
-            )}`;
-    }
-
-    if (initial) {
-        initial.textContent =
-            formatMoney(
-                archive.initialCapital
-            );
-    }
-
-    if (final) {
-        final.textContent =
-            formatMoney(finalBalance);
-    }
-
-    if (profit) {
-        profit.textContent =
-            formatMoney(totalProfit);
-    }
-
-
-    modal.classList.add("show");
-
-    modal.setAttribute(
-        "aria-hidden",
-        "false"
-    );
-
-
-    setTimeout(
-        () =>
-            drawArchiveChart(
-                archive
-            ),
-        20
-    );
-}
-
-
-function closeArchiveChartModal() {
-
-    const modal =
-        document.getElementById(
-            "archiveChartModal"
-        );
-
-    if (!modal) {
-        return;
-    }
-
-    modal.classList.remove("show");
-
-    modal.setAttribute(
-        "aria-hidden",
-        "true"
-    );
-}
-
-
-/* ============================================================
-   PÉRIODES
-   ============================================================ */
-
-function getTradeDate(trade) {
-
-    return (
-        trade.date ||
-        trade.tradeDate ||
-        ""
-    );
-}
-
-
-function getTradeDateObject(trade) {
-
-    const date =
-        getTradeDate(trade);
-
-    if (!date) {
-        return null;
-    }
-
-    const parsed =
-        new Date(
-            `${date}T12:00:00`
-        );
-
-    return Number.isNaN(
-        parsed.getTime()
-    )
-        ? null
-        : parsed;
-}
-
-
-function isToday(trade) {
-
-    return (
-        getTradeDate(trade) ===
-        getTodayDate()
-    );
-}
-
-
-function isThisWeek(trade) {
-
-    const date =
-        getTradeDateObject(trade);
-
-    if (!date) {
-        return false;
-    }
-
-
-    const now =
-        new Date();
-
-    const day =
-        now.getDay();
-
-    const diff =
-        day === 0
-            ? -6
-            : 1 - day;
-
-
-    const monday =
-        new Date(now);
-
-    monday.setHours(
-        0,
-        0,
-        0,
-        0
-    );
-
-    monday.setDate(
-        now.getDate() + diff
-    );
-
-
-    const sunday =
-        new Date(monday);
-
-    sunday.setDate(
-        monday.getDate() + 6
-    );
-
-    sunday.setHours(
-        23,
-        59,
-        59,
-        999
-    );
-
-
-    return (
-        date >= monday &&
-        date <= sunday
-    );
-}
-
-
-function isThisMonth(trade) {
-
-    const date =
-        getTradeDateObject(trade);
-
-    if (!date) {
-        return false;
-    }
-
-    const now =
-        new Date();
-
-    return (
-        date.getFullYear() ===
-            now.getFullYear() &&
-        date.getMonth() ===
-            now.getMonth()
-    );
-}
-
-
-function isThisYear(trade) {
-
-    const date =
-        getTradeDateObject(trade);
-
-    if (!date) {
-        return false;
-    }
-
-    return (
-        date.getFullYear() ===
-        new Date().getFullYear()
-    );
-}
-
-
-function filterTradesByPeriod(
-    tradeList,
-    period
-) {
-
-    if (period === "all") {
-        return [...tradeList];
-    }
-
-
-    return tradeList.filter(
-        trade => {
-
-            if (period === "today") {
-                return isToday(trade);
-            }
-
-            if (period === "week") {
-                return isThisWeek(trade);
-            }
-
-            if (period === "month") {
-                return isThisMonth(trade);
-            }
-
-            if (period === "year") {
-                return isThisYear(trade);
-            }
-
-            return true;
-        }
-    );
-}
-
-
-/* ============================================================
-   CALCULS TRADE
-   ============================================================ */
-
-function getTradeRiskDistance(trade) {
-
-    const entry =
-        Number(trade.entry);
-
-    const sl =
-        Number(trade.sl);
-
-    if (
-        !Number.isFinite(entry) ||
-        !Number.isFinite(sl)
-    ) {
-        return null;
-    }
-
-    return Math.abs(
-        entry - sl
-    );
-}
-
-
-function calculateTP(
-    entry,
-    sl,
-    direction,
-    rr
-) {
-
-    const distance =
-        Math.abs(
-            entry - sl
-        );
-
-    if (
-        !Number.isFinite(distance) ||
-        distance <= 0
-    ) {
-        return null;
-    }
-
-
-    if (direction === "BUY") {
-        return entry + distance * rr;
-    }
-
-    return entry - distance * rr;
-}
-
-
-function getTradeTargetRR(trade) {
-
-    const entry =
-        Number(trade.entry);
-
-    const sl =
-        Number(trade.sl);
-
-    const tp =
-        Number(trade.tp);
-
-
-    if (
-        !Number.isFinite(entry) ||
-        !Number.isFinite(sl) ||
-        !Number.isFinite(tp)
-    ) {
-        return null;
-    }
-
-
-    const risk =
-        Math.abs(entry - sl);
-
-    const reward =
-        Math.abs(tp - entry);
-
-
-    if (risk <= 0) {
-        return null;
-    }
-
-
-    return reward / risk;
-}
-
-
-function calculateRiskMoney(trade) {
-
-    if (
-        Number.isFinite(
-            Number(trade.riskMoney)
-        )
-    ) {
-        return Number(
-            trade.riskMoney
-        );
-    }
-
-
-    return getCapitalRisk(
-        activeCapital
-    );
-}
-
-
-function getCapitalForTrade(trade) {
-
-    if (
-        activeCapital &&
-        trade.capitalId ===
-            activeCapital.id
-    ) {
-        return activeCapital;
-    }
-
-    return activeCapital;
-}
-
-
-function calculateLotFromRisk(
-    trade
-) {
-
-    const capital =
-        getCapitalForTrade(trade);
-
-    const risk =
-        getCapitalRisk(capital);
-
-    const distance =
-        getTradeRiskDistance(trade);
-
-
-    if (
-        risk <= 0 ||
-        !distance ||
-        distance <= 0
-    ) {
-        return MIN_LOT;
-    }
-
-
-    /*
-       Modèle simplifié interne.
-       Le lot est plafonné à 2 décimales.
-    */
-
-    const lot =
-        risk /
-        (distance * 100);
-
-
-    if (!Number.isFinite(lot)) {
-        return MIN_LOT;
-    }
-
-
-    const rounded =
-        Math.floor(
-            lot / LOT_STEP
-        ) * LOT_STEP;
-
-
-    return Math.max(
-        MIN_LOT,
-        Number(
-            rounded.toFixed(2)
-        )
-    );
-}
-
-
-function calculateTradeProfit(trade) {
-
-    const risk =
-        Number(
-            trade.riskMoney
-        ) ||
-        getCapitalRisk(
-            getCapitalForTrade(trade)
-        );
-
-
-    const result =
-        String(
-            trade.result || ""
-        ).toUpperCase();
-
-
-    if (result === "TP") {
-        return risk *
-            getCapitalRR(
-                getCapitalForTrade(trade)
-            );
-    }
-
-
-    if (result === "SL") {
-        return -risk;
-    }
-
-
-    return 0;
-}
-
-
-function calculatePips(trade) {
-
-    const entry =
-        Number(trade.entry);
-
-    const exit =
-        trade.result === "TP"
-            ? Number(trade.tp)
-            : trade.result === "SL"
-                ? Number(trade.sl)
-                : entry;
-
-
-    if (
-        !Number.isFinite(entry) ||
-        !Number.isFinite(exit)
-    ) {
-        return 0;
-    }
-
-
-    const asset =
-        String(
-            trade.asset || ""
-        ).toUpperCase();
-
-
-    let pipSize =
-        0.0001;
-
-
-    if (
-        asset.includes("JPY")
-    ) {
-        pipSize = 0.01;
-    }
-
-    if (
-        asset === "XAUUSD"
-    ) {
-        pipSize = 0.1;
-    }
-
-    if (
-        asset === "BTCUSD"
-    ) {
-        pipSize = 1;
-    }
-
-
-    return (
-        Math.abs(
-            exit - entry
-        ) / pipSize
-    );
 }
 
 
@@ -1336,129 +1226,45 @@ function calculatePips(trade) {
    TRADE MODAL
    ============================================================ */
 
-function populateTradeForm() {
-
-    const asset =
-        document.getElementById(
-            "tradeAsset"
-        );
-
-    const setup =
-        document.getElementById(
-            "tradeSetup"
-        );
-
-
-    if (asset) {
-
-        asset.innerHTML =
-            ASSETS.map(
-                item =>
-                    `<option value="${escapeHtml(item)}">${escapeHtml(item)}</option>`
-            ).join("");
-    }
-
-
-    if (setup) {
-
-        setup.innerHTML =
-            SETUPS.map(
-                item =>
-                    `<option value="${escapeHtml(item)}">${escapeHtml(item)}</option>`
-            ).join("");
-    }
-}
-
-
 function openTradeModal() {
 
-    if (!activeCapital) {
+    const modal = $("tradeModal");
 
+    if (!modal) return;
+
+    if (!loadActiveCapital()) {
         alert(
-            "Crée d'abord un capital actif."
+            "Créez d'abord un capital actif avant d'ajouter un trade."
         );
-
-        openCapitalModal("new");
-
         return;
     }
-
-
-    const modal =
-        document.getElementById(
-            "tradeModal"
-        );
-
-    const form =
-        document.getElementById(
-            "tradeForm"
-        );
-
-
-    if (!modal || !form) {
-        return;
-    }
-
-
-    form.reset();
-
-
-    const date =
-        document.getElementById(
-            "tradeDate"
-        );
-
-    if (date) {
-        date.value =
-            getTodayDate();
-    }
-
-
-    updateAutomaticTradeValues();
-
 
     modal.classList.add("show");
-
-    modal.setAttribute(
-        "aria-hidden",
-        "false"
-    );
-
+    modal.setAttribute("aria-hidden", "false");
 
     document.body.classList.add(
         "trade-modal-open"
     );
 
+    if ($("tradeDate")) {
+        $("tradeDate").value = getTodayDate();
+    }
 
-    setTimeout(
-        () =>
-            document
-                .getElementById(
-                    "tradeAsset"
-                )
-                ?.focus(),
-        50
-    );
+    updateAutomaticTradeValues();
+
+    setTimeout(() => {
+        $("tradeAsset")?.focus();
+    }, 50);
 }
-
 
 function closeTradeModal() {
 
-    const modal =
-        document.getElementById(
-            "tradeModal"
-        );
+    const modal = $("tradeModal");
 
-    if (!modal) {
-        return;
-    }
+    if (!modal) return;
 
     modal.classList.remove("show");
-
-    modal.setAttribute(
-        "aria-hidden",
-        "true"
-    );
+    modal.setAttribute("aria-hidden", "true");
 
     document.body.classList.remove(
         "trade-modal-open"
@@ -1466,497 +1272,529 @@ function closeTradeModal() {
 }
 
 
+/* ============================================================
+   CALCULS AUTOMATIQUES DU FORMULAIRE TRADE
+   ============================================================ */
+
 function updateAutomaticTradeValues() {
 
-    const entry =
-        parseNumber(
-            document.getElementById(
-                "tradeEntry"
-            )?.value
-        );
+    const capital = loadActiveCapital();
 
-    const sl =
-        parseNumber(
-            document.getElementById(
-                "tradeSL"
-            )?.value
-        );
+    if (!capital) return;
+
+    const asset =
+        $("tradeAsset")?.value || "";
 
     const direction =
-        document.getElementById(
-            "tradeDirection"
-        )?.value ||
-        "BUY";
+        $("tradeDirection")?.value || "BUY";
 
+    const entry =
+        Number($("tradeEntry")?.value || 0);
+
+    const sl =
+        Number($("tradeSL")?.value || 0);
 
     const rr =
-        getCapitalRR(
-            activeCapital
+        Number(
+            $("tradeRR")?.value ||
+            capital.rrTarget ||
+            MIN_RR
         );
 
+    if (
+        !asset ||
+        !entry ||
+        !sl ||
+        entry === sl
+    ) {
+        if ($("tradeLot")) {
+            $("tradeLot").value = "";
+        }
 
-    const tp =
-        calculateTP(
+        if ($("tradeTP")) {
+            $("tradeTP").value = "";
+        }
+
+        if ($("calculatedRR")) {
+            $("calculatedRR").value = "";
+        }
+
+        return;
+    }
+
+    const calculated =
+        calculateTradeData({
+            asset,
+            direction,
             entry,
             sl,
-            direction,
-            rr
-        );
+            rr,
 
+            capital:
+                capital.currentBalance ||
+                capital.initialCapital,
 
-    const tpInput =
-        document.getElementById(
-            "tradeTP"
-        );
+            riskPercent:
+                capital.riskPercent
+        });
 
-    const rrInput =
-        document.getElementById(
-            "calculatedRR"
-        );
+    if ($("tradeLot")) {
 
-    const lotInput =
-        document.getElementById(
-            "tradeLot"
-        );
-
-    const profit =
-        document.getElementById(
-            "tradeProfit"
-        );
-
-    const info =
-        document.getElementById(
-            "tradeMMInfo"
-        );
-
-
-    if (tpInput) {
-
-        tpInput.value =
-            Number.isFinite(tp)
-                ? tp.toFixed(5)
+        $("tradeLot").value =
+            calculated.lot > 0
+                ? calculated.lot.toFixed(2)
                 : "";
     }
 
+    if ($("tradeTP")) {
 
-    if (
-        rrInput
-    ) {
+        $("tradeTP").value =
+            Number.isFinite(calculated.tp)
+                ? calculated.tp.toFixed(
+                    asset === "XAUUSD"
+                        ? 2
+                        : 5
+                )
+                : "";
+    }
 
-        rrInput.value =
-            Number.isFinite(tp)
+    if ($("calculatedRR")) {
+
+        $("calculatedRR").value =
+            Number.isFinite(calculated.tp)
                 ? rr.toFixed(2)
                 : "";
     }
 
+    if ($("tradeMMInfo")) {
 
-    const temporaryTrade = {
+        const loss =
+            calculated.riskMoney;
 
-        entry,
-        sl
-    };
+        const profit =
+            calculated.potentialProfit;
 
-
-    const lot =
-        calculateLotFromRisk(
-            temporaryTrade
-        );
-
-
-    if (lotInput) {
-        lotInput.value =
-            lot.toFixed(2);
+        $("tradeMMInfo").textContent =
+            `Risque : ${formatMoney(loss)} | ` +
+            `Gain potentiel : ${formatMoney(profit)}`;
     }
 
+    if ($("tradeProfit")) {
 
-    const result =
-        document.querySelector(
-            'input[name="tradeResult"]:checked'
-        )?.value ||
-        "TP";
-
-
-    const estimatedProfit =
-        result === "TP"
-            ? getCapitalRisk(activeCapital) *
-              rr
-            : result === "SL"
-                ? -getCapitalRisk(activeCapital)
-                : 0;
-
-
-    if (profit) {
-        profit.textContent =
-            formatMoney(
-                estimatedProfit
-            );
-    }
-
-
-    if (info) {
-
-        info.textContent =
-            `Risque : ${formatMoney(
-                getCapitalRisk(activeCapital)
-            )} · RR cible : ${rr.toFixed(2)} · Lot indicatif : ${lot.toFixed(2)}`;
+        $("tradeProfit").value =
+            Number.isFinite(calculated.potentialProfit)
+                ? calculated.potentialProfit.toFixed(2)
+                : "";
     }
 }
 
 
-function saveTrade(event) {
+/* ============================================================
+   ENREGISTRER UN TRADE
+   ============================================================ */
 
-    event.preventDefault();
+function submitTrade(event) {
 
+    if (event) {
+        event.preventDefault();
+    }
 
-    if (!activeCapital) {
+    const capital = loadActiveCapital();
 
-        alert(
-            "Aucun capital actif."
-        );
-
+    if (!capital) {
+        alert("Aucun capital actif.");
         return;
     }
 
-
     const asset =
-        document.getElementById(
-            "tradeAsset"
-        )?.value;
+        $("tradeAsset")?.value || "";
 
     const date =
-        document.getElementById(
-            "tradeDate"
-        )?.value;
+        $("tradeDate")?.value ||
+        getTodayDate();
 
     const direction =
-        document.getElementById(
-            "tradeDirection"
-        )?.value;
+        $("tradeDirection")?.value ||
+        "BUY";
 
     const orderType =
-        document.getElementById(
-            "tradeOrderType"
-        )?.value;
+        $("tradeOrderType")?.value ||
+        "Market";
 
     const entry =
-        parseNumber(
-            document.getElementById(
-                "tradeEntry"
-            )?.value
-        );
+        Number($("tradeEntry")?.value || 0);
 
     const sl =
-        parseNumber(
-            document.getElementById(
-                "tradeSL"
-            )?.value
-        );
+        Number($("tradeSL")?.value || 0);
 
-    const tp =
-        parseNumber(
-            document.getElementById(
-                "tradeTP"
-            )?.value
+    const rr =
+        Number(
+            $("tradeRR")?.value ||
+            capital.rrTarget ||
+            MIN_RR
         );
 
     const setup =
-        document.getElementById(
-            "tradeSetup"
-        )?.value;
+        $("tradeSetup")?.value ||
+        "";
 
     const result =
-        document.querySelector(
-            'input[name="tradeResult"]:checked'
-        )?.value;
+        normalizeTradeResult(
+            $("tradeResult")?.value ||
+            "BE"
+        );
 
     const comment =
-        document.getElementById(
-            "tradeComment"
-        )?.value.trim();
+        $("tradeComment")?.value ||
+        "";
 
+    if (!asset) {
+        alert("Sélectionnez un actif.");
+        return;
+    }
 
     if (
-        !asset ||
-        !date ||
-        !direction ||
         !Number.isFinite(entry) ||
-        !Number.isFinite(sl) ||
-        !Number.isFinite(tp) ||
-        !result
+        entry <= 0
     ) {
+        alert("Prix d'entrée invalide.");
+        return;
+    }
+
+    if (
+        !Number.isFinite(sl) ||
+        sl <= 0 ||
+        sl === entry
+    ) {
+        alert("Stop Loss invalide.");
+        return;
+    }
+
+    if (rr < MIN_RR) {
+        alert(
+            `Le RR minimum est ${MIN_RR.toFixed(2)}.`
+        );
+        return;
+    }
+
+    const calculated =
+        calculateTradeData({
+            asset,
+            direction,
+            entry,
+            sl,
+            rr,
+
+            capital:
+                capital.currentBalance ||
+                capital.initialCapital,
+
+            riskPercent:
+                capital.riskPercent
+        });
+
+    if (calculated.lot < MIN_LOT) {
 
         alert(
-            "Veuillez remplir correctement tous les champs obligatoires."
+            "Le risque demandé produit un lot inférieur au minimum de 0.01."
         );
 
         return;
     }
 
-
-    const risk =
-        getCapitalRisk(
-            activeCapital
-        );
-
-
-    const rr =
-        getCapitalRR(
-            activeCapital
-        );
-
-
-    const lot =
-        calculateLotFromRisk({
-            entry,
-            sl
-        });
-
+    const trades = loadTrades();
 
     const trade = {
 
-        id: generateId(),
+        id:
+            `trade_${Date.now()}_${Math.random()
+                .toString(36)
+                .slice(2, 8)}`,
 
         capitalId:
-            activeCapital.id,
+            capital.id,
+
+        capitalAtTrade:
+            Number(
+                capital.currentBalance ||
+                capital.initialCapital
+            ),
+
+        riskPercent:
+            Number(capital.riskPercent),
 
         asset,
 
         date,
 
         recordedAt:
-            new Date().toISOString(),
+            getNowISO(),
 
         direction,
 
         orderType,
 
-        lot,
-
         entry,
 
         sl,
 
-        tp,
+        tp:
+            calculated.tp,
 
         rr,
 
-        pips: 0,
+        lot:
+            calculated.lot,
 
         setup,
 
         result,
 
+        comment,
+
         riskMoney:
-            risk,
+            calculated.riskMoney,
 
-        pnl:
-            result === "TP"
-                ? risk * rr
-                : result === "SL"
-                    ? -risk
-                    : 0,
+        profit:
+            0,
 
-        comment
+        pips:
+            0
     };
 
+    /*
+        Le P/L est calculé selon le résultat.
+    */
 
-    trade.pips =
-        calculatePips(trade);
+    let exit = null;
 
+    if (result === "WIN") {
+        exit = calculated.tp;
+    }
 
-    trades.unshift(
-        trade
-    );
+    if (result === "LOSS") {
+        exit = sl;
+    }
 
+    if (result === "BE") {
+        exit = entry;
+    }
 
-    saveTrades();
+    if (Number.isFinite(exit)) {
+
+        trade.profit =
+            calculateTradeProfit(
+                asset,
+                direction,
+                entry,
+                exit,
+                calculated.lot
+            ) || 0;
+
+        trade.pips =
+            calculatePips(
+                entry,
+                exit,
+                asset
+            ) || 0;
+    }
+
+    trades.push(trade);
+
+    saveTrades(trades);
+
+    /*
+        Mise à jour du capital.
+    */
+
+    capital.currentBalance =
+        Number(
+            capital.currentBalance ||
+            capital.initialCapital
+        ) +
+        Number(trade.profit || 0);
+
+    capital.updatedAt =
+        getNowISO();
+
+    saveActiveCapital(capital);
 
     closeTradeModal();
+
+    $("tradeForm")?.reset();
 
     renderAll();
 }
 
 
 /* ============================================================
-   STATISTIQUES
+   SUPPRESSION D'UN TRADE
    ============================================================ */
 
-function calculateAdvancedStats(
-    tradeList
-) {
+function deleteTrade(tradeId) {
+
+    const trades = loadTrades();
+
+    const index =
+        trades.findIndex(
+            trade =>
+                trade.id === tradeId
+        );
+
+    if (index === -1) return;
+
+    if (!confirm("Supprimer ce trade ?")) {
+        return;
+    }
+
+    const trade = trades[index];
+
+    trades.splice(index, 1);
+
+    saveTrades(trades);
+
+    const capital = loadActiveCapital();
+
+    if (
+        capital &&
+        trade.capitalId === capital.id
+    ) {
+
+        capital.currentBalance =
+            Number(capital.currentBalance) -
+            Number(trade.profit || 0);
+
+        saveActiveCapital(capital);
+    }
+
+    renderAll();
+}
+
+
+/* ============================================================
+   STATISTIQUES AVANCÉES
+   ============================================================ */
+
+function calculateAdvancedStats(trades) {
 
     const list =
-        Array.isArray(tradeList)
-            ? tradeList
+        Array.isArray(trades)
+            ? trades
             : [];
 
-
-    const total =
-        list.length;
-
+    const profits =
+        list.map(
+            trade =>
+                Number(trade.profit || 0)
+        );
 
     const wins =
         list.filter(
-            t =>
-                String(t.result)
-                    .toUpperCase() === "TP"
-        ).length;
-
+            trade =>
+                normalizeTradeResult(
+                    trade.result
+                ) === "WIN"
+        );
 
     const losses =
         list.filter(
-            t =>
-                String(t.result)
-                    .toUpperCase() === "SL"
-        ).length;
-
-
-    const be =
-        list.filter(
-            t =>
-                String(t.result)
-                    .toUpperCase() === "BE"
-        ).length;
-
-
-    const profit =
-        calculateProfit(list);
-
-
-    const winrate =
-        total > 0
-            ? wins / total * 100
-            : 0;
-
-
-    const winningTrades =
-        list.filter(
-            t =>
-                Number(t.pnl) > 0
+            trade =>
+                normalizeTradeResult(
+                    trade.result
+                ) === "LOSS"
         );
 
-
-    const losingTrades =
+    const breakevens =
         list.filter(
-            t =>
-                Number(t.pnl) < 0
+            trade =>
+                normalizeTradeResult(
+                    trade.result
+                ) === "BE"
         );
 
-
-    const grossProfit =
-        winningTrades.reduce(
-            (sum, t) =>
-                sum + Number(t.pnl),
+    const totalProfit =
+        profits.reduce(
+            (sum, value) =>
+                sum + value,
             0
         );
 
+    const winrate =
+        list.length
+            ? wins.length / list.length * 100
+            : 0;
+
+    const averageTrade =
+        list.length
+            ? totalProfit / list.length
+            : 0;
+
+    const winningProfits =
+        wins.map(
+            trade =>
+                Number(trade.profit || 0)
+        );
+
+    const losingProfits =
+        losses.map(
+            trade =>
+                Number(trade.profit || 0)
+        );
+
+    const averageWin =
+        winningProfits.length
+            ? winningProfits.reduce(
+                (a, b) => a + b,
+                0
+            ) / winningProfits.length
+            : 0;
+
+    const averageLoss =
+        losingProfits.length
+            ? losingProfits.reduce(
+                (a, b) => a + b,
+                0
+            ) / losingProfits.length
+            : 0;
+
+    const grossProfit =
+        winningProfits.reduce(
+            (a, b) => a + b,
+            0
+        );
 
     const grossLoss =
         Math.abs(
-            losingTrades.reduce(
-                (sum, t) =>
-                    sum + Number(t.pnl),
+            losingProfits.reduce(
+                (a, b) => a + b,
                 0
             )
         );
 
-
     const profitFactor =
         grossLoss > 0
             ? grossProfit / grossLoss
-            : null;
-
-
-    const averageTrade =
-        total > 0
-            ? profit / total
-            : 0;
-
-
-    const averageWin =
-        winningTrades.length > 0
-            ? grossProfit /
-              winningTrades.length
-            : 0;
-
-
-    const averageLoss =
-        losingTrades.length > 0
-            ? -grossLoss /
-              losingTrades.length
-            : 0;
-
-
-    let currentWinStreak = 0;
-    let currentLossStreak = 0;
+            : grossProfit > 0
+                ? Infinity
+                : 0;
 
     let maxWinStreak = 0;
     let maxLossStreak = 0;
 
+    let currentWinStreak = 0;
+    let currentLossStreak = 0;
 
-    let equity = 0;
-    let peak = 0;
-    let maxDrawdown = 0;
+    list.forEach(trade => {
 
+        const result =
+            normalizeTradeResult(
+                trade.result
+            );
 
-    const sorted =
-        [...list].sort(
-            (a, b) =>
-                new Date(
-                    a.recordedAt ||
-                    a.date
-                ) -
-                new Date(
-                    b.recordedAt ||
-                    b.date
-                )
-        );
+        if (result === "WIN") {
 
-
-    sorted.forEach(
-        trade => {
-
-            const pnl =
-                Number(trade.pnl) || 0;
-
-
-            equity += pnl;
-
-
-            if (equity > peak) {
-                peak = equity;
-            }
-
-
-            const drawdown =
-                equity - peak;
-
-
-            if (
-                drawdown <
-                maxDrawdown
-            ) {
-                maxDrawdown =
-                    drawdown;
-            }
-
-
-            if (pnl > 0) {
-
-                currentWinStreak++;
-                currentLossStreak = 0;
-
-            } else if (pnl < 0) {
-
-                currentLossStreak++;
-                currentWinStreak = 0;
-
-            } else {
-
-                currentWinStreak = 0;
-                currentLossStreak = 0;
-            }
-
+            currentWinStreak++;
+            currentLossStreak = 0;
 
             maxWinStreak =
                 Math.max(
@@ -1964,17 +1802,50 @@ function calculateAdvancedStats(
                     currentWinStreak
                 );
 
+        } else if (result === "LOSS") {
+
+            currentLossStreak++;
+            currentWinStreak = 0;
 
             maxLossStreak =
                 Math.max(
                     maxLossStreak,
                     currentLossStreak
                 );
+
         }
-    );
+    });
 
+    /*
+        Drawdown sur la courbe cumulée.
+    */
 
-    const rrValues =
+    let balance = 0;
+    let peak = 0;
+    let maxDrawdown = 0;
+
+    list.forEach(trade => {
+
+        balance +=
+            Number(trade.profit || 0);
+
+        peak =
+            Math.max(
+                peak,
+                balance
+            );
+
+        const drawdown =
+            balance - peak;
+
+        maxDrawdown =
+            Math.min(
+                maxDrawdown,
+                drawdown
+            );
+    });
+
+    const averageRRValues =
         list
             .map(
                 trade =>
@@ -1985,30 +1856,39 @@ function calculateAdvancedStats(
                     Number.isFinite(value)
             );
 
-
     const averageRR =
-        rrValues.length > 0
-            ? rrValues.reduce(
-                (sum, value) =>
-                    sum + value,
+        averageRRValues.length
+            ? averageRRValues.reduce(
+                (a, b) => a + b,
                 0
             ) /
-              rrValues.length
-            : null;
+            averageRRValues.length
+            : 0;
 
+    const bestTrade =
+        profits.length
+            ? Math.max(...profits)
+            : 0;
+
+    const worstTrade =
+        profits.length
+            ? Math.min(...profits)
+            : 0;
 
     return {
 
-        total,
-        wins,
-        losses,
-        be,
+        trades: list.length,
 
-        profit,
+        wins: wins.length,
+
+        losses: losses.length,
+
+        breakevens:
+            breakevens.length,
+
+        totalProfit,
 
         winrate,
-
-        profitFactor,
 
         averageTrade,
 
@@ -2016,1576 +1896,509 @@ function calculateAdvancedStats(
 
         averageLoss,
 
+        grossProfit,
+
+        grossLoss,
+
+        profitFactor,
+
         maxWinStreak,
 
         maxLossStreak,
 
         maxDrawdown,
 
-        averageRR
+        averageRR,
+
+        bestTrade,
+
+        worstTrade
     };
 }
 
 
-function calculateRiskStats(
-    filteredTrades
-) {
+/* ============================================================
+   STATISTIQUES RISQUE — V51
+   ============================================================ */
 
-    const values = [];
+function calculateRiskStats(trades) {
 
+    const list =
+        Array.isArray(trades)
+            ? trades
+            : [];
 
-    filteredTrades.forEach(
-        trade => {
+    const risks =
+        list
+            .map(
+                trade =>
+                    Number(
+                        trade.riskPercent
+                    )
+            )
+            .filter(
+                value =>
+                    Number.isFinite(value)
+            );
 
-            const risk =
-                Number(
-                    trade.riskMoney
-                );
-
-
-            if (
-                Number.isFinite(risk) &&
-                risk > 0
-            ) {
-                values.push(risk);
-            }
-        }
-    );
-
-
-    const reference =
-        getCapitalRisk(
-            activeCapital
-        );
-
-
-    if (
-        values.length === 0
-    ) {
+    if (!risks.length) {
 
         return {
-
-            averageRisk: null,
-            minimumRisk: null,
-            maximumRisk: null,
+            averageRisk: 0,
+            minimumRisk: 0,
+            maximumRisk: 0,
             referenceRisk:
-                reference || null,
-
-            averageDeviation: null,
-
-            riskRegularity: null,
-
+                getCapitalRiskPercent(),
+            averageDeviation: 0,
+            regularity: 0,
             compliantTrades: 0,
-
             nonCompliantTrades: 0
         };
     }
 
+    const referenceRisk =
+        getCapitalRiskPercent();
 
-    const average =
-        values.reduce(
-            (sum, value) =>
-                sum + value,
+    const averageRisk =
+        risks.reduce(
+            (a, b) => a + b,
             0
-        ) /
-        values.length;
+        ) / risks.length;
 
+    const minimumRisk =
+        Math.min(...risks);
 
-    const minimum =
-        Math.min(...values);
+    const maximumRisk =
+        Math.max(...risks);
 
-    const maximum =
-        Math.max(...values);
-
-
-    let deviationTotal = 0;
-
-    let compliant = 0;
-
-    let nonCompliant = 0;
-
-
-    values.forEach(
-        value => {
-
-            if (reference > 0) {
-
-                const deviation =
-                    Math.abs(
-                        value - reference
-                    ) /
-                    reference;
-
-                deviationTotal +=
-                    deviation;
-
-                if (
-                    deviation <=
-                    RISK_TOLERANCE
-                ) {
-                    compliant++;
-                } else {
-                    nonCompliant++;
-                }
-            }
-        }
-    );
-
+    const deviations =
+        risks.map(
+            risk =>
+                Math.abs(
+                    risk - referenceRisk
+                )
+        );
 
     const averageDeviation =
-        reference > 0
-            ? deviationTotal /
-              values.length *
-              100
-            : null;
+        deviations.reduce(
+            (a, b) => a + b,
+            0
+        ) / deviations.length;
 
+    const tolerance =
+        referenceRisk *
+        RISK_TOLERANCE;
+
+    const compliantTrades =
+        risks.filter(
+            risk =>
+                Math.abs(
+                    risk - referenceRisk
+                ) <= tolerance
+        ).length;
+
+    const nonCompliantTrades =
+        risks.length -
+        compliantTrades;
 
     const regularity =
-        reference > 0
-            ? compliant /
-              values.length *
-              100
-            : null;
-
+        risks.length
+            ? compliantTrades /
+                risks.length *
+                100
+            : 0;
 
     return {
 
-        averageRisk:
-            average,
+        averageRisk,
 
-        minimumRisk:
-            minimum,
+        minimumRisk,
 
-        maximumRisk:
-            maximum,
+        maximumRisk,
 
-        referenceRisk:
-            reference || null,
+        referenceRisk,
 
         averageDeviation,
 
-        riskRegularity:
-            regularity,
+        regularity,
 
-        compliantTrades:
-            compliant,
+        compliantTrades,
 
-        nonCompliantTrades:
-            nonCompliant
+        nonCompliantTrades
     };
 }
 
 
 /* ============================================================
-   PERFORMANCE
+   SETUPS
    ============================================================ */
 
-function renderPerformance() {
+function buildSetupStats(trades) {
 
-    const list =
-        filterTradesByPeriod(
-            getActiveCapitalTrades(),
-            currentPerformancePeriod
-        );
+    const stats = {};
 
+    trades.forEach(trade => {
 
-    const stats =
-        calculateAdvancedStats(list);
+        const setup =
+            trade.setup ||
+            "Sans setup";
 
+        if (!stats[setup]) {
 
-    setText(
-        "statBalance",
-        formatMoney(
-            calculateCurrentBalance()
-        )
-    );
+            stats[setup] = {
 
+                setup,
 
-    setText(
-        "statProfit",
-        formatMoney(
-            stats.profit
-        )
-    );
+                trades: 0,
 
+                wins: 0,
 
-    setText(
-        "statWinrate",
-        stats.winrate.toFixed(1) + "%"
-    );
+                losses: 0,
 
+                breakevens: 0,
 
-    setText(
-        "statAverageRR",
-        stats.averageRR !== null
-            ? stats.averageRR.toFixed(2)
-            : "-"
-    );
-
-
-    setText(
-        "statTrades",
-        String(stats.total)
-    );
-
-
-    const setupRows =
-        buildSetupStats(list);
-
-
-    setText(
-        "statBestSetup",
-        setupRows.length > 0
-            ? setupRows[0].setup
-            : "-"
-    );
-
-
-    setText(
-        "statLastTrade",
-        list.length > 0
-            ? getTradeDate(
-                list[0]
-            )
-            : "-"
-    );
-
-
-    setText(
-        "statProfitFactor",
-        stats.profitFactor !== null
-            ? stats.profitFactor.toFixed(2)
-            : "-"
-    );
-
-
-    setText(
-        "statAverageTrade",
-        formatMoney(
-            stats.averageTrade
-        )
-    );
-
-
-    setText(
-        "statAverageWin",
-        formatMoney(
-            stats.averageWin
-        )
-    );
-
-
-    setText(
-        "statAverageLoss",
-        formatMoney(
-            stats.averageLoss
-        )
-    );
-
-
-    setText(
-        "statBestTrade",
-        formatMoney(
-            list.length
-                ? Math.max(
-                    ...list.map(
-                        t =>
-                            Number(t.pnl) || 0
-                    )
-                )
-                : 0
-        )
-    );
-
-
-    setText(
-        "statWorstTrade",
-        formatMoney(
-            list.length
-                ? Math.min(
-                    ...list.map(
-                        t =>
-                            Number(t.pnl) || 0
-                    )
-                )
-                : 0
-        )
-    );
-
-
-    setText(
-        "statMaxWinStreak",
-        String(
-            stats.maxWinStreak
-        )
-    );
-
-
-    setText(
-        "statMaxLossStreak",
-        String(
-            stats.maxLossStreak
-        )
-    );
-
-
-    setText(
-        "statMaxDrawdown",
-        formatMoney(
-            stats.maxDrawdown
-        )
-    );
-
-
-    renderHistory();
-
-    colorStatValues();
-}
-
-
-function buildSetupStats(
-    tradeList
-) {
-
-    const map = {};
-
-
-    tradeList.forEach(
-        trade => {
-
-            const setup =
-                String(
-                    trade.setup ||
-                    "Sans setup"
-                ).trim() ||
-                "Sans setup";
-
-
-            if (!map[setup]) {
-
-                map[setup] = {
-
-                    setup,
-
-                    trades: 0,
-
-                    wins: 0,
-
-                    losses: 0,
-
-                    be: 0,
-
-                    profit: 0
-                };
-            }
-
-
-            map[setup].trades++;
-
-
-            const result =
-                String(
-                    trade.result ||
-                    ""
-                ).toUpperCase();
-
-
-            if (result === "TP") {
-                map[setup].wins++;
-            }
-
-            if (result === "SL") {
-                map[setup].losses++;
-            }
-
-            if (result === "BE") {
-                map[setup].be++;
-            }
-
-
-            map[setup].profit +=
-                Number(trade.pnl) || 0;
+                profit: 0
+            };
         }
-    );
 
+        const item =
+            stats[setup];
 
-    return Object.values(map)
-        .sort(
-            (a, b) =>
-                b.profit -
-                a.profit
-        );
-}
+        item.trades++;
 
-
-function buildAssetStats(
-    tradeList
-) {
-
-    const map = {};
-
-
-    tradeList.forEach(
-        trade => {
-
-            const asset =
-                String(
-                    trade.asset ||
-                    "Sans actif"
-                ).trim() ||
-                "Sans actif";
-
-
-            if (!map[asset]) {
-
-                map[asset] = {
-
-                    asset,
-
-                    trades: 0,
-
-                    wins: 0,
-
-                    losses: 0,
-
-                    be: 0,
-
-                    profit: 0
-                };
-            }
-
-
-            map[asset].trades++;
-
-
-            const result =
-                String(
-                    trade.result ||
-                    ""
-                ).toUpperCase();
-
-
-            if (result === "TP") {
-                map[asset].wins++;
-            }
-
-            if (result === "SL") {
-                map[asset].losses++;
-            }
-
-            if (result === "BE") {
-                map[asset].be++;
-            }
-
-
-            map[asset].profit +=
-                Number(trade.pnl) || 0;
-        }
-    );
-
-
-    return Object.values(map)
-        .sort(
-            (a, b) =>
-                b.profit -
-                a.profit
-        );
-}
-
-
-function renderHistory() {
-
-    const tbody =
-        document.getElementById(
-            "historyBody"
-        );
-
-
-    if (!tbody) {
-        return;
-    }
-
-
-    const list =
-        [...getActiveCapitalTrades()]
-            .sort(
-                (a, b) =>
-                    new Date(
-                        b.recordedAt ||
-                        b.date
-                    ) -
-                    new Date(
-                        a.recordedAt ||
-                        a.date
-                    )
+        const result =
+            normalizeTradeResult(
+                trade.result
             );
 
+        if (result === "WIN") {
+            item.wins++;
+        }
 
-    if (list.length === 0) {
+        if (result === "LOSS") {
+            item.losses++;
+        }
 
-        tbody.innerHTML = `
-            <tr>
-                <td
-                    colspan="14"
-                    class="empty-state"
-                >
-                    Aucun trade enregistré.
-                </td>
-            </tr>
-        `;
+        if (result === "BE") {
+            item.breakevens++;
+        }
 
-        return;
-    }
+        item.profit +=
+            Number(trade.profit || 0);
+    });
 
-
-    tbody.innerHTML =
-        list.map(
-            trade => {
-
-                const pnl =
-                    Number(trade.pnl) || 0;
-
-
-                const result =
-                    String(
-                        trade.result || ""
-                    ).toUpperCase();
-
-
-                return `
-
-                    <tr>
-
-                        <td>
-                            ${escapeHtml(
-                                getTradeDate(trade)
-                            )}
-                        </td>
-
-                        <td>
-                            ${escapeHtml(
-                                formatStoredDateTime(
-                                    trade.recordedAt
-                                )
-                            )}
-                        </td>
-
-                        <td>
-                            ${escapeHtml(
-                                trade.asset
-                            )}
-                        </td>
-
-                        <td>
-                            <span class="${
-                                trade.direction === "BUY"
-                                    ? "text-green"
-                                    : "text-red"
-                            }">
-                                ${escapeHtml(
-                                    trade.direction
-                                )}
-                            </span>
-                        </td>
-
-                        <td>
-                            ${formatNumber(
-                                trade.lot,
-                                2
-                            )}
-                        </td>
-
-                        <td>
-                            ${formatNumber(
-                                trade.entry,
-                                5
-                            )}
-                        </td>
-
-                        <td>
-                            ${formatNumber(
-                                trade.sl,
-                                5
-                            )}
-                        </td>
-
-                        <td>
-                            ${formatNumber(
-                                trade.tp,
-                                5
-                            )}
-                        </td>
-
-                        <td>
-                            ${formatNumber(
-                                getTradeTargetRR(
-                                    trade
-                                ),
-                                2
-                            )}
-                        </td>
-
-                        <td>
-                            ${formatNumber(
-                                trade.pips,
-                                1
-                            )}
-                        </td>
-
-                        <td>
-                            ${escapeHtml(
-                                trade.setup
-                            )}
-                        </td>
-
-                        <td>
-                            <span class="result-badge ${
-                                result === "TP"
-                                    ? "win"
-                                    : result === "SL"
-                                        ? "loss"
-                                        : "neutral"
-                            }">
-                                ${escapeHtml(
-                                    result
-                                )}
-                            </span>
-                        </td>
-
-                        <td class="${
-                            pnl > 0
-                                ? "positive"
-                                : pnl < 0
-                                    ? "negative"
-                                    : ""
-                        }">
-                            ${formatMoney(pnl)}
-                        </td>
-
-                        <td>
-                            <button
-                                class="delete-btn"
-                                type="button"
-                                data-delete-trade="${
-                                    escapeHtml(
-                                        trade.id
-                                    )
-                                }"
-                            >
-                                Supprimer
-                            </button>
-                        </td>
-
-                    </tr>
-
-                `;
-            }
-        ).join("");
-}
-
-
-function deleteTrade(id) {
-
-    const trade =
-        trades.find(
-            item =>
-                item.id === id
+    return Object.values(stats)
+        .sort(
+            (a, b) =>
+                b.profit - a.profit
         );
-
-
-    if (!trade) {
-        return;
-    }
-
-
-    if (
-        !confirm(
-            "Supprimer ce trade ?"
-        )
-    ) {
-        return;
-    }
-
-
-    trades =
-        trades.filter(
-            item =>
-                item.id !== id
-        );
-
-
-    saveTrades();
-
-    renderAll();
 }
 
 
 /* ============================================================
-   DASHBOARD
+   ACTIFS
    ============================================================ */
 
-function renderDashboard() {
+function buildAssetStats(trades) {
 
-    const name =
-        document.getElementById(
-            "activeCapitalName"
-        );
+    const stats = {};
 
-    const created =
-        document.getElementById(
-            "activeCapitalCreatedAt"
-        );
+    trades.forEach(trade => {
 
+        const asset =
+            trade.asset ||
+            "Sans actif";
 
-    if (!activeCapital) {
+        if (!stats[asset]) {
 
-        if (name) {
-            name.textContent =
-                "Aucun capital";
+            stats[asset] = {
+
+                asset,
+
+                trades: 0,
+
+                wins: 0,
+
+                losses: 0,
+
+                breakevens: 0,
+
+                profit: 0
+            };
         }
 
-        if (created) {
-            created.textContent =
-                "Crée un capital pour commencer.";
-        }
+        const item =
+            stats[asset];
 
-        setText(
-            "initialCapital",
-            "$0.00"
-        );
+        item.trades++;
 
-        setText(
-            "currentBalance",
-            "$0.00"
-        );
-
-        setText(
-            "totalProfit",
-            "$0.00"
-        );
-
-        setText(
-            "riskReference",
-            "$0.00"
-        );
-
-        setText(
-            "rrTarget",
-            MIN_RR.toFixed(2)
-        );
-
-        setText(
-            "theoreticalObjective",
-            "$0.00"
-        );
-
-        drawCapitalChart([]);
-
-        return;
-    }
-
-
-    if (name) {
-        name.textContent =
-            activeCapital.name;
-    }
-
-
-    if (created) {
-        created.textContent =
-            `Créé le ${formatStoredDateTime(
-                activeCapital.createdAt
-            )}`;
-    }
-
-
-    const capitalTrades =
-        getActiveCapitalTrades();
-
-
-    const profit =
-        calculateProfit(
-            capitalTrades
-        );
-
-
-    setText(
-        "initialCapital",
-        formatMoney(
-            activeCapital.initialCapital
-        )
-    );
-
-
-    setText(
-        "currentBalance",
-        formatMoney(
-            calculateCurrentBalance()
-        )
-    );
-
-
-    setText(
-        "totalProfit",
-        formatMoney(profit)
-    );
-
-
-    setText(
-        "riskReference",
-        formatMoney(
-            getCapitalRisk()
-        )
-    );
-
-
-    setText(
-        "rrTarget",
-        getCapitalRR().toFixed(2)
-    );
-
-
-    setText(
-        "theoreticalObjective",
-        formatMoney(
-            getCapitalObjective()
-        )
-    );
-
-
-    drawCapitalChart(
-        capitalTrades
-    );
-}
-
-
-/* ============================================================
-   GRAPHIQUES NATIFS
-   ============================================================ */
-
-function prepareCanvas(
-    canvas
-) {
-
-    const rect =
-        canvas.getBoundingClientRect();
-
-
-    const ratio =
-        window.devicePixelRatio ||
-        1;
-
-
-    canvas.width =
-        Math.max(
-            1,
-            rect.width * ratio
-        );
-
-    canvas.height =
-        Math.max(
-            1,
-            rect.height * ratio
-        );
-
-
-    const ctx =
-        canvas.getContext("2d");
-
-
-    ctx.setTransform(
-        ratio,
-        0,
-        0,
-        ratio,
-        0,
-        0
-    );
-
-
-    return {
-        ctx,
-        width: rect.width,
-        height: rect.height
-    };
-}
-
-
-function drawLineChart(
-    canvas,
-    values
-) {
-
-    if (!canvas) {
-        return;
-    }
-
-
-    const {
-
-        ctx,
-
-        width,
-
-        height
-
-    } = prepareCanvas(canvas);
-
-
-    ctx.clearRect(
-        0,
-        0,
-        width,
-        height
-    );
-
-
-    if (
-        values.length === 0
-    ) {
-        return;
-    }
-
-
-    const padding = 35;
-
-
-    const min =
-        Math.min(...values);
-
-    const max =
-        Math.max(...values);
-
-
-    const range =
-        max - min || 1;
-
-
-    ctx.beginPath();
-
-
-    values.forEach(
-        (value, index) => {
-
-            const x =
-                padding +
-                (
-                    width -
-                    padding * 2
-                ) *
-                (
-                    index /
-                    Math.max(
-                        values.length - 1,
-                        1
-                    )
-                );
-
-
-            const y =
-                height -
-                padding -
-                (
-                    (
-                        value - min
-                    ) /
-                    range
-                ) *
-                (
-                    height -
-                    padding * 2
-                );
-
-
-            if (index === 0) {
-                ctx.moveTo(
-                    x,
-                    y
-                );
-            } else {
-                ctx.lineTo(
-                    x,
-                    y
-                );
-            }
-        }
-    );
-
-
-    ctx.strokeStyle =
-        "#38bdf8";
-
-    ctx.lineWidth = 2;
-
-    ctx.stroke();
-
-
-    ctx.fillStyle =
-        "#38bdf8";
-
-
-    values.forEach(
-        (value, index) => {
-
-            const x =
-                padding +
-                (
-                    width -
-                    padding * 2
-                ) *
-                (
-                    index /
-                    Math.max(
-                        values.length - 1,
-                        1
-                    )
-                );
-
-
-            const y =
-                height -
-                padding -
-                (
-                    (
-                        value - min
-                    ) /
-                    range
-                ) *
-                (
-                    height -
-                    padding * 2
-                );
-
-
-            ctx.beginPath();
-
-            ctx.arc(
-                x,
-                y,
-                3,
-                0,
-                Math.PI * 2
+        const result =
+            normalizeTradeResult(
+                trade.result
             );
 
-            ctx.fill();
-        }
-    );
-}
-
-
-function drawCapitalChart(
-    capitalTrades
-) {
-
-    const canvas =
-        document.getElementById(
-            "capitalChart"
-        );
-
-
-    const empty =
-        document.getElementById(
-            "emptyChartMessage"
-        );
-
-
-    if (!canvas) {
-        return;
-    }
-
-
-    const sorted =
-        [...capitalTrades]
-            .sort(
-                (a, b) =>
-                    new Date(
-                        a.recordedAt ||
-                        a.date
-                    ) -
-                    new Date(
-                        b.recordedAt ||
-                        b.date
-                    )
-            );
-
-
-    if (
-        !activeCapital ||
-        sorted.length === 0
-    ) {
-
-        if (empty) {
-            empty.style.display =
-                "flex";
+        if (result === "WIN") {
+            item.wins++;
         }
 
-        prepareCanvas(canvas);
-
-        return;
-    }
-
-
-    if (empty) {
-        empty.style.display =
-            "none";
-    }
-
-
-    let balance =
-        Number(
-            activeCapital.initialCapital
-        ) || 0;
-
-
-    const values =
-        [balance];
-
-
-    sorted.forEach(
-        trade => {
-
-            balance +=
-                Number(
-                    trade.pnl
-                ) || 0;
-
-            values.push(balance);
+        if (result === "LOSS") {
+            item.losses++;
         }
-    );
 
+        if (result === "BE") {
+            item.breakevens++;
+        }
 
-    drawLineChart(
-        canvas,
-        values
-    );
-}
+        item.profit +=
+            Number(trade.profit || 0);
+    });
 
-
-function drawArchiveChart(
-    archive
-) {
-
-    const canvas =
-        document.getElementById(
-            "archiveChart"
-        );
-
-
-    if (!canvas) {
-        return;
-    }
-
-
-    let balance =
-        Number(
-            archive.initialCapital
-        ) || 0;
-
-
-    const values =
-        [balance];
-
-
-    const sorted =
-        [...(
-            Array.isArray(
-                archive.trades
-            )
-                ? archive.trades
-                : []
-        )]
+    return Object.values(stats)
         .sort(
             (a, b) =>
-                new Date(
-                    a.recordedAt ||
-                    a.date
-                ) -
-                new Date(
-                    b.recordedAt ||
-                    b.date
-                )
+                b.profit - a.profit
         );
-
-
-    sorted.forEach(
-        trade => {
-
-            balance +=
-                Number(
-                    trade.pnl
-                ) || 0;
-
-            values.push(balance);
-        }
-    );
-
-
-    drawLineChart(
-        canvas,
-        values
-    );
 }
 
 
 /* ============================================================
-   ARCHIVES — AFFICHAGE
+   SETUP RANKING — V51
    ============================================================ */
 
-function renderArchives() {
+function calculateSetupRanking(trades) {
 
-    const container =
-        document.getElementById(
-            "archivesList"
-        );
+    return buildSetupStats(trades)
+        .map(item => ({
 
+            setup:
+                item.setup,
 
-    if (!container) {
-        return;
-    }
+            trades:
+                item.trades,
 
+            winrate:
+                item.trades
+                    ? item.wins /
+                        item.trades *
+                        100
+                    : 0,
 
-    if (archives.length === 0) {
+            profit:
+                item.profit
+        }))
+        .sort(
+            (a, b) => {
 
-        container.innerHTML = `
-            <div class="empty-state">
-                Aucun capital archivé.
-            </div>
-        `;
-
-        return;
-    }
-
-
-    container.innerHTML =
-        archives.map(
-            archive => {
-
-                const archiveTrades =
-                    Array.isArray(
-                        archive.trades
-                    )
-                        ? archive.trades
-                        : [];
-
-
-                const profit =
-                    calculateProfit(
-                        archiveTrades
+                if (
+                    b.profit !==
+                    a.profit
+                ) {
+                    return (
+                        b.profit -
+                        a.profit
                     );
+                }
 
-
-                const finalBalance =
-                    Number(
-                        archive.initialCapital
-                    ) +
-                    profit;
-
-
-                return `
-
-                    <article class="archive-card">
-
-                        <div class="archive-card-header">
-
-                            <div>
-
-                                <h3>
-                                    ${escapeHtml(
-                                        archive.name
-                                    )}
-                                </h3>
-
-                                <p>
-                                    Archivé le
-                                    ${escapeHtml(
-                                        formatStoredDateTime(
-                                            archive.archivedAt
-                                        )
-                                    )}
-                                </p>
-
-                            </div>
-
-                        </div>
-
-
-                        <div class="archive-stats">
-
-                            <div class="archive-stat">
-
-                                <span>
-                                    Capital initial
-                                </span>
-
-                                <strong>
-                                    ${formatMoney(
-                                        archive.initialCapital
-                                    )}
-                                </strong>
-
-                            </div>
-
-
-                            <div class="archive-stat">
-
-                                <span>
-                                    Capital final
-                                </span>
-
-                                <strong class="${
-                                    profit >= 0
-                                        ? "text-green"
-                                        : "text-red"
-                                }">
-                                    ${formatMoney(
-                                        finalBalance
-                                    )}
-                                </strong>
-
-                            </div>
-
-
-                            <div class="archive-stat">
-
-                                <span>
-                                    Profit
-                                </span>
-
-                                <strong class="${
-                                    profit >= 0
-                                        ? "text-green"
-                                        : "text-red"
-                                }">
-                                    ${formatMoney(
-                                        profit
-                                    )}
-                                </strong>
-
-                            </div>
-
-
-                            <div class="archive-stat">
-
-                                <span>
-                                    Trades
-                                </span>
-
-                                <strong>
-                                    ${archiveTrades.length}
-                                </strong>
-
-                            </div>
-
-                        </div>
-
-
-                        <div class="archive-actions">
-
-                            <button
-                                class="archive-view-btn"
-                                type="button"
-                                data-view-archive="${
-                                    escapeHtml(
-                                        archive.id
-                                    )
-                                }"
-                            >
-                                Voir
-                            </button>
-
-                            <button
-                                class="archive-delete-btn"
-                                type="button"
-                                data-delete-archive="${
-                                    escapeHtml(
-                                        archive.id
-                                    )
-                                }"
-                            >
-                                Supprimer
-                            </button>
-
-                        </div>
-
-                    </article>
-
-                `;
+                return (
+                    b.winrate -
+                    a.winrate
+                );
             }
-        ).join("");
+        );
 }
 
 
 /* ============================================================
-   NAVIGATION
+   PÉRIODE
    ============================================================ */
 
-function showPage(
-    pageId
+function getDateObject(dateValue) {
+
+    if (!dateValue) {
+        return null;
+    }
+
+    const date =
+        new Date(
+            `${dateValue}T00:00:00`
+        );
+
+    return Number.isNaN(
+        date.getTime()
+    )
+        ? null
+        : date;
+}
+
+function filterTradesByPeriod(
+    trades,
+    period
 ) {
+
+    const list =
+        Array.isArray(trades)
+            ? trades
+            : [];
+
+    if (
+        !period ||
+        period === "all"
+    ) {
+        return list;
+    }
+
+    const now = new Date();
+
+    return list.filter(trade => {
+
+        const date =
+            getDateObject(
+                trade.date
+            );
+
+        if (!date) return false;
+
+        if (period === "today") {
+
+            return (
+                date.getFullYear() ===
+                    now.getFullYear() &&
+
+                date.getMonth() ===
+                    now.getMonth() &&
+
+                date.getDate() ===
+                    now.getDate()
+            );
+        }
+
+        if (period === "week") {
+
+            const start =
+                new Date(now);
+
+            start.setDate(
+                now.getDate() -
+                ((now.getDay() + 6) % 7)
+            );
+
+            start.setHours(
+                0, 0, 0, 0
+            );
+
+            return date >= start;
+        }
+
+        if (period === "month") {
+
+            return (
+                date.getFullYear() ===
+                    now.getFullYear() &&
+
+                date.getMonth() ===
+                    now.getMonth()
+            );
+        }
+
+        if (period === "year") {
+
+            return (
+                date.getFullYear() ===
+                now.getFullYear()
+            );
+        }
+
+        return true;
+    });
+}
+
+
+/* ============================================================
+   NAVIGATION 4 PAGES
+   ============================================================ */
+
+function isAnalysisPage() {
+
+    const page =
+        document.querySelector(
+            ".page-section.active"
+        );
+
+    return Boolean(
+        page &&
+        page.id === "pageAnalysis"
+    );
+}
+
+function showPage(pageName) {
 
     const pages =
         document.querySelectorAll(
             ".page-section"
         );
 
+    pages.forEach(page => {
 
-    pages.forEach(
-        page => {
+        page.classList.toggle(
+            "active",
+            page.id ===
+                `page${
+                    pageName.charAt(0)
+                        .toUpperCase() +
+                    pageName.slice(1)
+                }`
+        );
+    });
 
-            page.classList.toggle(
-                "active",
-                page.id === pageId
-            );
-        }
-    );
-
-
-    const links =
+    const navLinks =
         document.querySelectorAll(
-            ".app-nav-link"
+            "[data-page]"
         );
 
+    navLinks.forEach(link => {
 
-    links.forEach(
-        link => {
+        link.classList.toggle(
+            "active",
+            link.dataset.page ===
+                pageName
+        );
+    });
 
-            link.classList.toggle(
-                "active",
-                link.dataset.page ===
-                pageId
-            );
-        }
-    );
-
-
-    if (
-        pageId ===
-        "analysisPage"
-    ) {
-        renderAnalysis();
+    if (pageName === "analysis") {
+        renderAnalysisPage();
     }
 
-
-    if (
-        pageId ===
-        "performancePage"
-    ) {
-        renderPerformance();
+    if (pageName === "performance") {
+        renderPerformancePage();
     }
 
-
-    if (
-        pageId ===
-        "archivesPage"
-    ) {
+    if (pageName === "archives") {
         renderArchives();
     }
 
-
-    if (
-        pageId ===
-        "dashboardPage"
-    ) {
+    if (pageName === "dashboard") {
         renderDashboard();
     }
 }
 
+function initializeNavigation() {
 
-function isAnalysisPage() {
+    document
+        .querySelectorAll("[data-page]")
+        .forEach(link => {
 
-    return (
-        document
-            .getElementById(
-                "analysisPage"
-            )
-            ?.classList.contains(
-                "active"
-            ) || false
-    );
-}
+            link.addEventListener(
+                "click",
+                event => {
 
+                    event.preventDefault();
 
-/* ============================================================
-   ANALYSE
-   ============================================================ */
-
-function renderAnalysis() {
-
-    const filtered =
-        filterTradesByPeriod(
-            getActiveCapitalTrades(),
-            currentAnalysisPeriod
-        );
-
-
-    if (
-        typeof displayRiskStats ===
-        "function"
-    ) {
-        displayRiskStats(
-            filtered
-        );
-    }
-
-
-    if (
-        typeof displayRRStats ===
-        "function"
-    ) {
-        displayRRStats(
-            filtered
-        );
-    }
-
-
-    if (
-        typeof renderSetupPerformance ===
-        "function"
-    ) {
-        renderSetupPerformance(
-            filtered
-        );
-    }
-
-
-    if (
-        typeof renderAssetPerformance ===
-        "function"
-    ) {
-        renderAssetPerformance(
-            filtered
-        );
-    }
-
-
-    if (
-        typeof renderSetupRanking ===
-        "function"
-    ) {
-        renderSetupRanking(
-            filtered
-        );
-    }
-
-
-    if (
-        typeof renderRecommendations ===
-        "function"
-    ) {
-        renderRecommendations(
-            filtered
-        );
-    }
-
-
-    if (
-        typeof renderCalendar ===
-        "function"
-    ) {
-        renderCalendar(
-            filtered
-        );
-    }
+                    showPage(
+                        link.dataset.page
+                    );
+                }
+            );
+        });
 }
 
 
@@ -3595,573 +2408,1677 @@ function renderAnalysis() {
 
 function initializeTheme() {
 
-    const saved =
+    const savedTheme =
         localStorage.getItem(
-            THEME_KEY
+            STORAGE_KEYS.theme
+        ) || "dark";
+
+    document.documentElement
+        .setAttribute(
+            "data-theme",
+            savedTheme
         );
-
-
-    if (
-        saved ===
-        "light"
-    ) {
-
-        document.body.classList.add(
-            "light"
-        );
-
-    } else {
-
-        document.body.classList.remove(
-            "light"
-        );
-    }
-
 
     const button =
-        document.getElementById(
-            "themeToggle"
-        );
+        $("themeToggle");
 
+    if (!button) return;
 
-    if (!button) {
-        return;
-    }
+    button.addEventListener(
+        "click",
+        () => {
 
+            const current =
+                document.documentElement
+                    .getAttribute(
+                        "data-theme"
+                    );
 
-    button.textContent =
-        document.body.classList.contains(
-            "light"
-        )
-            ? "☀"
-            : "◐";
-}
+            const next =
+                current === "dark"
+                    ? "light"
+                    : "dark";
 
+            document.documentElement
+                .setAttribute(
+                    "data-theme",
+                    next
+                );
 
-function toggleTheme() {
-
-    document.body.classList.toggle(
-        "light"
+            localStorage.setItem(
+                STORAGE_KEYS.theme,
+                next
+            );
+        }
     );
-
-
-    const light =
-        document.body.classList.contains(
-            "light"
-        );
-
-
-    localStorage.setItem(
-        THEME_KEY,
-        light
-            ? "light"
-            : "dark"
-    );
-
-
-    const button =
-        document.getElementById(
-            "themeToggle"
-        );
-
-
-    if (button) {
-        button.textContent =
-            light
-                ? "☀"
-                : "◐";
-    }
-
-
-    renderAll();
 }
 
 
 /* ============================================================
-   PÉRIODE
+   DASHBOARD
    ============================================================ */
 
-function updatePeriodButtons() {
+function renderDashboard() {
+
+    const capital =
+        loadActiveCapital();
+
+    const trades =
+        loadTrades();
+
+    if ($("activeCapitalName")) {
+
+        $("activeCapitalName")
+            .textContent =
+            capital?.name ||
+            "Aucun capital";
+    }
+
+    if ($("activeCapitalCreatedAt")) {
+
+        $("activeCapitalCreatedAt")
+            .textContent =
+            capital?.createdAt
+                ? new Date(
+                    capital.createdAt
+                ).toLocaleDateString(
+                    "fr-FR"
+                )
+                : "—";
+    }
+
+    const initial =
+        Number(
+            capital?.initialCapital || 0
+        );
+
+    const current =
+        Number(
+            capital?.currentBalance ||
+            initial
+        );
+
+    const profit =
+        current - initial;
+
+    if ($("initialCapital")) {
+        $("initialCapital")
+            .textContent =
+            formatMoney(initial);
+    }
+
+    if ($("currentBalance")) {
+        $("currentBalance")
+            .textContent =
+            formatMoney(current);
+    }
+
+    if ($("totalProfit")) {
+        $("totalProfit")
+            .textContent =
+            formatMoney(profit);
+    }
+
+    if ($("riskReference")) {
+
+        $("riskReference")
+            .textContent =
+            formatPercent(
+                capital?.riskPercent || 0
+            );
+    }
+
+    if ($("rrTarget")) {
+
+        $("rrTarget")
+            .textContent =
+            Number(
+                capital?.rrTarget ||
+                MIN_RR
+            ).toFixed(2);
+    }
+
+    if ($("theoreticalObjective")) {
+
+        const riskMoney =
+            calculateRiskMoney(
+                current,
+                capital?.riskPercent || 0
+            );
+
+        const objective =
+            riskMoney *
+            Number(
+                capital?.rrTarget ||
+                MIN_RR
+            );
+
+        $("theoreticalObjective")
+            .textContent =
+            formatMoney(objective);
+    }
+
+    renderCapitalChart(trades);
+}
+
+
+/* ============================================================
+   GRAPHIQUE CAPITAL
+   ============================================================ */
+
+function renderCapitalChart(trades) {
+
+    const canvas =
+        $("capitalChart");
+
+    if (!canvas) return;
+
+    const ctx =
+        canvas.getContext("2d");
+
+    const width =
+        canvas.width =
+        canvas.clientWidth || 700;
+
+    const height =
+        canvas.height =
+        canvas.clientHeight || 300;
+
+    ctx.clearRect(
+        0,
+        0,
+        width,
+        height
+    );
+
+    const capital =
+        loadActiveCapital();
+
+    const initial =
+        Number(
+            capital?.initialCapital || 0
+        );
+
+    const capitalTrades =
+        trades
+            .filter(
+                trade =>
+                    !capital ||
+                    trade.capitalId ===
+                    capital.id
+            )
+            .sort(
+                (a, b) =>
+                    new Date(
+                        a.recordedAt ||
+                        a.date
+                    ) -
+                    new Date(
+                        b.recordedAt ||
+                        b.date
+                    )
+            );
+
+    if (!capitalTrades.length) {
+
+        if ($("emptyChartMessage")) {
+            $("emptyChartMessage")
+                .style.display =
+                "block";
+        }
+
+        return;
+    }
+
+    if ($("emptyChartMessage")) {
+        $("emptyChartMessage")
+            .style.display =
+            "none";
+    }
+
+    let balance = initial;
+
+    const points = [
+        {
+            balance
+        }
+    ];
+
+    capitalTrades.forEach(trade => {
+
+        balance +=
+            Number(
+                trade.profit || 0
+            );
+
+        points.push({
+            balance
+        });
+    });
+
+    const values =
+        points.map(
+            point =>
+                point.balance
+        );
+
+    const min =
+        Math.min(...values);
+
+    const max =
+        Math.max(...values);
+
+    const range =
+        max - min || 1;
+
+    const padding = 30;
+
+    ctx.beginPath();
+
+    points.forEach(
+        (point, index) => {
+
+            const x =
+                padding +
+                (
+                    index /
+                    Math.max(
+                        points.length - 1,
+                        1
+                    )
+                ) *
+                (
+                    width -
+                    padding * 2
+                );
+
+            const y =
+                height -
+                padding -
+                (
+                    (
+                        point.balance -
+                        min
+                    ) /
+                    range
+                ) *
+                (
+                    height -
+                    padding * 2
+                );
+
+            if (index === 0) {
+                ctx.moveTo(x, y);
+            } else {
+                ctx.lineTo(x, y);
+            }
+        }
+    );
+
+    ctx.strokeStyle =
+        getComputedStyle(
+            document.documentElement
+        ).getPropertyValue(
+            "--accent"
+        ) ||
+        "#4f8cff";
+
+    ctx.lineWidth = 3;
+
+    ctx.stroke();
+}
+
+
+/* ============================================================
+   PERFORMANCE
+   ============================================================ */
+
+function renderPerformancePage(
+    period = "all"
+) {
+
+    const allTrades =
+        loadTrades();
+
+    const trades =
+        filterTradesByPeriod(
+            allTrades,
+            period
+        );
+
+    const stats =
+        calculateAdvancedStats(
+            trades
+        );
+
+    setText(
+        "statBalance",
+        formatMoney(
+            getCurrentBalance()
+        )
+    );
+
+    setText(
+        "statProfit",
+        formatMoney(
+            stats.totalProfit
+        )
+    );
+
+    setText(
+        "statWinrate",
+        formatPercent(
+            stats.winrate
+        )
+    );
+
+    setText(
+        "statAverageRR",
+        stats.averageRR
+            ? stats.averageRR.toFixed(2)
+            : "—"
+    );
+
+    setText(
+        "statTrades",
+        stats.trades
+    );
+
+    const setupRanking =
+        calculateSetupRanking(
+            trades
+        );
+
+    setText(
+        "statBestSetup",
+        setupRanking.length
+            ? setupRanking[0].setup
+            : "—"
+    );
+
+    const lastTrade =
+        trades.length
+            ? trades[
+                trades.length - 1
+            ]
+            : null;
+
+    setText(
+        "statLastTrade",
+        lastTrade?.date ||
+        "—"
+    );
+
+    setText(
+        "statProfitFactor",
+        Number.isFinite(
+            stats.profitFactor
+        )
+            ? stats.profitFactor.toFixed(2)
+            : "∞"
+    );
+
+    setText(
+        "statAverageTrade",
+        formatMoney(
+            stats.averageTrade
+        )
+    );
+
+    setText(
+        "statAverageWin",
+        formatMoney(
+            stats.averageWin
+        )
+    );
+
+    setText(
+        "statAverageLoss",
+        formatMoney(
+            stats.averageLoss
+        )
+    );
+
+    setText(
+        "statBestTrade",
+        formatMoney(
+            stats.bestTrade
+        )
+    );
+
+    setText(
+        "statWorstTrade",
+        formatMoney(
+            stats.worstTrade
+        )
+    );
+
+    setText(
+        "statMaxWinStreak",
+        stats.maxWinStreak
+    );
+
+    setText(
+        "statMaxLossStreak",
+        stats.maxLossStreak
+    );
+
+    setText(
+        "statMaxDrawdown",
+        formatMoney(
+            stats.maxDrawdown
+        )
+    );
+
+    renderPerformanceSetupTable(
+        trades
+    );
+
+    renderPerformanceAssetTable(
+        trades
+    );
+
+    renderHistory(
+        trades
+    );
+}
+
+
+/* ============================================================
+   TABLE SETUPS PERFORMANCE
+   ============================================================ */
+
+function renderPerformanceSetupTable(
+    trades
+) {
+
+    const body =
+        $("setupTableBody");
+
+    if (!body) return;
+
+    const stats =
+        buildSetupStats(
+            trades
+        );
+
+    if (!stats.length) {
+
+        body.innerHTML = `
+            <tr>
+                <td colspan="7">
+                    Aucun trade pour cette période.
+                </td>
+            </tr>
+        `;
+
+        return;
+    }
+
+    body.innerHTML =
+        stats.map(item => {
+
+            const winrate =
+                item.trades
+                    ? item.wins /
+                        item.trades *
+                        100
+                    : 0;
+
+            return `
+                <tr>
+                    <td>${escapeValue(
+                        item.setup
+                    )}</td>
+
+                    <td>${item.trades}</td>
+
+                    <td>${item.wins}</td>
+
+                    <td>${item.losses}</td>
+
+                    <td>${formatPercent(
+                        winrate
+                    )}</td>
+
+                    <td>${item.breakevens}</td>
+
+                    <td class="${
+                        item.profit >= 0
+                            ? "profit"
+                            : "loss"
+                    }">
+                        ${formatMoney(
+                            item.profit
+                        )}
+                    </td>
+                </tr>
+            `;
+        }).join("");
+}
+
+
+/* ============================================================
+   TABLE ACTIFS PERFORMANCE
+   ============================================================ */
+
+function renderPerformanceAssetTable(
+    trades
+) {
+
+    const body =
+        $("assetTableBody");
+
+    if (!body) return;
+
+    const stats =
+        buildAssetStats(
+            trades
+        );
+
+    if (!stats.length) {
+
+        body.innerHTML = `
+            <tr>
+                <td colspan="10">
+                    Aucun trade pour cette période.
+                </td>
+            </tr>
+        `;
+
+        return;
+    }
+
+    body.innerHTML =
+        stats.map(item => {
+
+            const winrate =
+                item.trades
+                    ? item.wins /
+                        item.trades *
+                        100
+                    : 0;
+
+            const assetTrades =
+                trades.filter(
+                    trade =>
+                        trade.asset ===
+                        item.asset
+                );
+
+            const rrValues =
+                assetTrades
+                    .map(
+                        trade =>
+                            getTradeTargetRR(
+                                trade
+                            )
+                    )
+                    .filter(
+                        value =>
+                            Number.isFinite(
+                                value
+                            )
+                    );
+
+            const averageRR =
+                rrValues.length
+                    ? rrValues.reduce(
+                        (a, b) =>
+                            a + b,
+                        0
+                    ) /
+                    rrValues.length
+                    : 0;
+
+            const profits =
+                assetTrades.map(
+                    trade =>
+                        Number(
+                            trade.profit || 0
+                        )
+                );
+
+            const best =
+                profits.length
+                    ? Math.max(
+                        ...profits
+                    )
+                    : 0;
+
+            const worst =
+                profits.length
+                    ? Math.min(
+                        ...profits
+                    )
+                    : 0;
+
+            return `
+                <tr>
+
+                    <td>${escapeValue(
+                        item.asset
+                    )}</td>
+
+                    <td>${item.trades}</td>
+
+                    <td>${item.wins}</td>
+
+                    <td>${item.losses}</td>
+
+                    <td>${item.breakevens}</td>
+
+                    <td>${formatPercent(
+                        winrate
+                    )}</td>
+
+                    <td class="${
+                        item.profit >= 0
+                            ? "profit"
+                            : "loss"
+                    }">
+                        ${formatMoney(
+                            item.profit
+                        )}
+                    </td>
+
+                    <td>
+                        ${
+                            averageRR
+                                ? averageRR.toFixed(2)
+                                : "—"
+                        }
+                    </td>
+
+                    <td class="profit">
+                        ${formatMoney(best)}
+                    </td>
+
+                    <td class="loss">
+                        ${formatMoney(worst)}
+                    </td>
+
+                </tr>
+            `;
+        }).join("");
+}
+
+
+/* ============================================================
+   HISTORIQUE
+   ============================================================ */
+
+function renderHistory(
+    trades = loadTrades()
+) {
+
+    const body =
+        $("historyBody");
+
+    if (!body) return;
+
+    const list =
+        [...trades].sort(
+            (a, b) =>
+                new Date(
+                    b.recordedAt ||
+                    b.date
+                ) -
+                new Date(
+                    a.recordedAt ||
+                    a.date
+                )
+        );
+
+    if (!list.length) {
+
+        body.innerHTML = `
+            <tr>
+                <td colspan="14">
+                    Aucun trade enregistré.
+                </td>
+            </tr>
+        `;
+
+        return;
+    }
+
+    body.innerHTML =
+        list.map(trade => {
+
+            const result =
+                normalizeTradeResult(
+                    trade.result
+                );
+
+            return `
+                <tr>
+
+                    <td>${escapeValue(
+                        trade.date
+                    )}</td>
+
+                    <td>
+                        ${
+                            trade.recordedAt
+                                ? new Date(
+                                    trade.recordedAt
+                                ).toLocaleString(
+                                    "fr-FR"
+                                )
+                                : "—"
+                        }
+                    </td>
+
+                    <td>${escapeValue(
+                        trade.asset
+                    )}</td>
+
+                    <td>
+                        <span class="badge ${
+                            trade.direction === "BUY"
+                                ? "buy"
+                                : "sell"
+                        }">
+                            ${escapeValue(
+                                trade.direction
+                            )}
+                        </span>
+                    </td>
+
+                    <td>
+                        ${formatNumber(
+                            trade.lot,
+                            2
+                        )}
+                    </td>
+
+                    <td>
+                        ${formatNumber(
+                            trade.entry,
+                            5
+                        )}
+                    </td>
+
+                    <td>
+                        ${formatNumber(
+                            trade.sl,
+                            5
+                        )}
+                    </td>
+
+                    <td>
+                        ${formatNumber(
+                            trade.tp,
+                            5
+                        )}
+                    </td>
+
+                    <td>
+                        ${Number(
+                            trade.rr || 0
+                        ).toFixed(2)}
+                    </td>
+
+                    <td>
+                        ${formatNumber(
+                            trade.pips,
+                            1
+                        )}
+                    </td>
+
+                    <td>
+                        ${escapeValue(
+                            trade.setup ||
+                            "—"
+                        )}
+                    </td>
+
+                    <td>
+                        <span class="badge result-${result.toLowerCase()}">
+                            ${escapeValue(
+                                result
+                            )}
+                        </span>
+                    </td>
+
+                    <td class="${
+                        Number(
+                            trade.profit || 0
+                        ) >= 0
+                            ? "profit"
+                            : "loss"
+                    }">
+                        ${formatMoney(
+                            trade.profit
+                        )}
+                    </td>
+
+                    <td>
+                        <button
+                            class="danger small"
+                            type="button"
+                            data-delete-trade="${
+                                escapeValue(
+                                    trade.id
+                                )
+                            }"
+                        >
+                            Supprimer
+                        </button>
+                    </td>
+
+                </tr>
+            `;
+        }).join("");
+
+    body
+        .querySelectorAll(
+            "[data-delete-trade]"
+        )
+        .forEach(button => {
+
+            button.addEventListener(
+                "click",
+                () => {
+
+                    deleteTrade(
+                        button.dataset.deleteTrade
+                    );
+                }
+            );
+        });
+}
+
+
+/* ============================================================
+   ANALYSE & RISQUE — V51
+   ============================================================ */
+
+function renderAnalysisPage(
+    period = "all"
+) {
+
+    const trades =
+        filterTradesByPeriod(
+            loadTrades(),
+            period
+        );
+
+    currentAnalysisTrades =
+        trades;
+
+    if (typeof displayRiskStats === "function") {
+        displayRiskStats(trades);
+    }
+
+    if (typeof displayRRStats === "function") {
+        displayRRStats(trades);
+    }
+
+    if (typeof renderSetupPerformance === "function") {
+        renderSetupPerformance(trades);
+    }
+
+    if (typeof renderAssetPerformance === "function") {
+        renderAssetPerformance(trades);
+    }
+
+    if (typeof renderSetupRanking === "function") {
+        renderSetupRanking(trades);
+    }
+
+    if (typeof generateRecommendations === "function") {
+
+        const recommendations =
+            generateRecommendations(
+                trades
+            );
+
+        const container =
+            $("v51Recommendations");
+
+        if (container) {
+
+            if (Array.isArray(
+                recommendations
+            )) {
+
+                container.innerHTML =
+                    recommendations
+                        .map(
+                            item =>
+                                `<div class="recommendation">
+                                    ${escapeValue(item)}
+                                </div>`
+                        )
+                        .join("");
+
+            } else {
+
+                container.innerHTML =
+                    `<div class="recommendation">
+                        ${escapeValue(
+                            recommendations ||
+                            "Aucune recommandation."
+                        )}
+                    </div>`;
+            }
+        }
+    }
+
+    if (typeof renderCalendar === "function") {
+        renderCalendar(trades);
+    }
+}
+
+
+/* ============================================================
+   ARCHIVES
+   ============================================================ */
+
+function renderArchives() {
+
+    const container =
+        $("archivesList");
+
+    if (!container) return;
+
+    const archives =
+        loadArchives();
+
+    if (!archives.length) {
+
+        container.innerHTML = `
+            <div class="empty-state">
+                Aucune archive disponible.
+            </div>
+        `;
+
+        return;
+    }
+
+    container.innerHTML =
+        archives.map(
+            (archive, index) => {
+
+                const initial =
+                    Number(
+                        archive.initialCapital ||
+                        0
+                    );
+
+                const final =
+                    Number(
+                        archive.finalBalance ||
+                        archive.currentBalance ||
+                        0
+                    );
+
+                const profit =
+                    final - initial;
+
+                return `
+                    <article class="archive-card">
+
+                        <div>
+                            <h3>
+                                ${escapeValue(
+                                    archive.name ||
+                                    "Capital"
+                                )}
+                            </h3>
+
+                            <p>
+                                Créé le :
+                                ${
+                                    archive.createdAt
+                                        ? new Date(
+                                            archive.createdAt
+                                        ).toLocaleDateString(
+                                            "fr-FR"
+                                        )
+                                        : "—"
+                                }
+                            </p>
+
+                            <p>
+                                Archivé le :
+                                ${
+                                    archive.archivedAt
+                                        ? new Date(
+                                            archive.archivedAt
+                                        ).toLocaleDateString(
+                                            "fr-FR"
+                                        )
+                                        : "—"
+                                }
+                            </p>
+                        </div>
+
+                        <div class="archive-values">
+
+                            <div>
+                                <span>Initial</span>
+                                <strong>
+                                    ${formatMoney(initial)}
+                                </strong>
+                            </div>
+
+                            <div>
+                                <span>Final</span>
+                                <strong>
+                                    ${formatMoney(final)}
+                                </strong>
+                            </div>
+
+                            <div>
+                                <span>Résultat</span>
+                                <strong class="${
+                                    profit >= 0
+                                        ? "profit"
+                                        : "loss"
+                                }">
+                                    ${formatMoney(profit)}
+                                </strong>
+                            </div>
+
+                        </div>
+
+                        <div class="archive-actions">
+
+                            <button
+                                type="button"
+                                class="secondary"
+                                data-open-archive="${
+                                    index
+                                }"
+                            >
+                                Voir
+                            </button>
+
+                            <button
+                                type="button"
+                                class="danger"
+                                data-delete-archive="${
+                                    index
+                                }"
+                            >
+                                Supprimer
+                            </button>
+
+                        </div>
+
+                    </article>
+                `;
+            }
+        ).join("");
+
+    container
+        .querySelectorAll(
+            "[data-open-archive]"
+        )
+        .forEach(button => {
+
+            button.addEventListener(
+                "click",
+                () => {
+
+                    openArchiveChart(
+                        Number(
+                            button.dataset.openArchive
+                        )
+                    );
+                }
+            );
+        });
+
+    container
+        .querySelectorAll(
+            "[data-delete-archive]"
+        )
+        .forEach(button => {
+
+            button.addEventListener(
+                "click",
+                () => {
+
+                    deleteArchive(
+                        Number(
+                            button.dataset.deleteArchive
+                        )
+                    );
+                }
+            );
+        });
+}
+
+
+/* ============================================================
+   GRAPHIQUE ARCHIVE
+   ============================================================ */
+
+function openArchiveChart(index) {
+
+    const archives =
+        loadArchives();
+
+    const archive =
+        archives[index];
+
+    if (!archive) return;
+
+    const modal =
+        $("archiveChartModal");
+
+    if (!modal) return;
+
+    setText(
+        "archiveChartTitle",
+        archive.name ||
+        "Archive"
+    );
+
+    setText(
+        "archiveChartSubtitle",
+        archive.archivedAt
+            ? new Date(
+                archive.archivedAt
+            ).toLocaleDateString(
+                "fr-FR"
+            )
+            : ""
+    );
+
+    setText(
+        "archiveChartInitial",
+        formatMoney(
+            archive.initialCapital
+        )
+    );
+
+    setText(
+        "archiveChartFinal",
+        formatMoney(
+            archive.finalBalance
+        )
+    );
+
+    setText(
+        "archiveChartProfit",
+        formatMoney(
+            archive.profit
+        )
+    );
+
+    modal.classList.add("show");
+    modal.setAttribute(
+        "aria-hidden",
+        "false"
+    );
+
+    renderArchiveChart(
+        archive
+    );
+}
+
+function closeArchiveChart() {
+
+    const modal =
+        $("archiveChartModal");
+
+    if (!modal) return;
+
+    modal.classList.remove("show");
+
+    modal.setAttribute(
+        "aria-hidden",
+        "true"
+    );
+}
+
+function renderArchiveChart(
+    archive
+) {
+
+    const canvas =
+        $("archiveChart");
+
+    if (!canvas) return;
+
+    const ctx =
+        canvas.getContext("2d");
+
+    const trades =
+        Array.isArray(
+            archive.trades
+        )
+            ? archive.trades
+            : [];
+
+    const width =
+        canvas.width =
+        canvas.clientWidth || 700;
+
+    const height =
+        canvas.height =
+        canvas.clientHeight || 300;
+
+    ctx.clearRect(
+        0,
+        0,
+        width,
+        height
+    );
+
+    let balance =
+        Number(
+            archive.initialCapital ||
+            0
+        );
+
+    const points = [
+        balance
+    ];
+
+    trades.forEach(trade => {
+
+        balance +=
+            Number(
+                trade.profit || 0
+            );
+
+        points.push(
+            balance
+        );
+    });
+
+    if (points.length < 2) {
+        return;
+    }
+
+    const min =
+        Math.min(...points);
+
+    const max =
+        Math.max(...points);
+
+    const range =
+        max - min || 1;
+
+    const padding = 30;
+
+    ctx.beginPath();
+
+    points.forEach(
+        (value, index) => {
+
+            const x =
+                padding +
+                index /
+                (
+                    points.length - 1
+                ) *
+                (
+                    width -
+                    padding * 2
+                );
+
+            const y =
+                height -
+                padding -
+                (
+                    value - min
+                ) /
+                range *
+                (
+                    height -
+                    padding * 2
+                );
+
+            if (index === 0) {
+                ctx.moveTo(x, y);
+            } else {
+                ctx.lineTo(x, y);
+            }
+        }
+    );
+
+    ctx.strokeStyle =
+        getComputedStyle(
+            document.documentElement
+        ).getPropertyValue(
+            "--accent"
+        ) ||
+        "#4f8cff";
+
+    ctx.lineWidth = 3;
+
+    ctx.stroke();
+}
+
+
+/* ============================================================
+   CALENDRIER
+   ============================================================ */
+
+function getCalendarTrades(
+    trades
+) {
+
+    const result = {};
+
+    trades.forEach(trade => {
+
+        if (!trade.date) return;
+
+        if (!result[trade.date]) {
+
+            result[trade.date] = {
+                count: 0,
+                profit: 0
+            };
+        }
+
+        result[trade.date].count++;
+
+        result[trade.date].profit +=
+            Number(
+                trade.profit || 0
+            );
+    });
+
+    return result;
+}
+
+
+/* ============================================================
+   TEXTE
+   ============================================================ */
+
+function setText(id, value) {
+
+    const element = $(id);
+
+    if (element) {
+        element.textContent =
+            value ?? "—";
+    }
+}
+
+
+/* ============================================================
+   BOUTONS PÉRIODE
+   ============================================================ */
+
+function initializePeriodButtons() {
 
     document
         .querySelectorAll(
             "[data-period]"
         )
-        .forEach(
-            button => {
+        .forEach(button => {
 
-                button.classList.toggle(
-                    "active",
-                    button.dataset.period ===
-                    currentAnalysisPeriod
-                );
-            }
-        );
+            button.addEventListener(
+                "click",
+                () => {
 
-
-    document
-        .querySelectorAll(
-            "[data-performance-period]"
-        )
-        .forEach(
-            button => {
-
-                button.classList.toggle(
-                    "active",
-                    button.dataset.performancePeriod ===
-                    currentPerformancePeriod
-                );
-            }
-        );
-}
-
-
-/* ============================================================
-   OUTILS DOM
-   ============================================================ */
-
-function setText(
-    id,
-    value
-) {
-
-    const element =
-        document.getElementById(id);
-
-
-    if (element) {
-        element.textContent =
-            value;
-    }
-}
-
-
-function colorStatValues() {
-
-    document
-        .querySelectorAll(
-            ".stat-box strong"
-        )
-        .forEach(
-            element => {
-
-                const text =
-                    element.textContent;
-
-                element.classList.remove(
-                    "positive",
-                    "negative"
-                );
-
-
-                if (
-                    text.startsWith("$-") ||
-                    text.startsWith("-$")
-                ) {
-                    element.classList.add(
-                        "negative"
-                    );
-                }
-
-
-                if (
-                    text.startsWith("$") &&
-                    !text.startsWith("$-")
-                ) {
-                    element.classList.add(
-                        "positive"
-                    );
-                }
-            }
-        );
-}
-
-
-/* ============================================================
-   ÉVÉNEMENTS
-   ============================================================ */
-
-function initializeEvents() {
-
-    document
-        .querySelectorAll(
-            ".app-nav-link"
-        )
-        .forEach(
-            button => {
-
-                button.addEventListener(
-                    "click",
-                    () =>
-                        showPage(
-                            button.dataset.page
+                    document
+                        .querySelectorAll(
+                            "[data-period]"
                         )
-                );
-            }
-        );
+                        .forEach(
+                            item =>
+                                item.classList
+                                    .remove(
+                                        "active"
+                                    )
+                        );
+
+                    button.classList.add(
+                        "active"
+                    );
+
+                    const period =
+                        button.dataset.period;
+
+                    const page =
+                        document.querySelector(
+                            ".page-section.active"
+                        );
+
+                    if (
+                        page?.id ===
+                        "pagePerformance"
+                    ) {
+
+                        renderPerformancePage(
+                            period
+                        );
+                    }
+
+                    if (
+                        page?.id ===
+                        "pageAnalysis"
+                    ) {
+
+                        renderAnalysisPage(
+                            period
+                        );
+                    }
+                }
+            );
+        });
+}
 
 
-    document
-        .getElementById(
-            "themeToggle"
-        )
+/* ============================================================
+   INITIALISATION MODALES
+   ============================================================ */
+
+function initializeModals() {
+
+    $("openTradeModalBtn")
         ?.addEventListener(
             "click",
-            toggleTheme
+            openTradeModal
         );
 
+    $("closeTradeModal")
+        ?.addEventListener(
+            "click",
+            closeTradeModal
+        );
 
-    document
-        .getElementById(
-            "newCapitalBtn"
-        )
+    $("cancelTradeBtn")
+        ?.addEventListener(
+            "click",
+            closeTradeModal
+        );
+
+    $("tradeModal")
+        ?.addEventListener(
+            "click",
+            event => {
+
+                if (
+                    event.target ===
+                    $("tradeModal")
+                ) {
+                    closeTradeModal();
+                }
+            }
+        );
+
+    $("tradeForm")
+        ?.addEventListener(
+            "submit",
+            submitTrade
+        );
+
+    [
+        "tradeAsset",
+        "tradeDirection",
+        "tradeEntry",
+        "tradeSL",
+        "tradeRR"
+    ].forEach(id => {
+
+        $(id)?.addEventListener(
+            "input",
+            updateAutomaticTradeValues
+        );
+
+        $(id)?.addEventListener(
+            "change",
+            updateAutomaticTradeValues
+        );
+    });
+
+
+    /* Capital */
+
+    $("newCapitalBtn")
         ?.addEventListener(
             "click",
             () =>
                 openCapitalModal("new")
         );
 
-
-    document
-        .getElementById(
-            "changeCapitalBtn"
-        )
+    $("changeCapitalBtn")
         ?.addEventListener(
             "click",
             () =>
-                activeCapital
-                    ? openCapitalModal("edit")
-                    : openCapitalModal("new")
+                openCapitalModal("edit")
         );
 
-
-    document
-        .getElementById(
-            "archiveCapitalBtn"
-        )
+    $("archiveCapitalBtn")
         ?.addEventListener(
             "click",
-            archiveCurrentCapital
+            archiveActiveCapital
         );
 
-
-    document
-        .getElementById(
-            "capitalForm"
-        )
+    $("saveCapitalBtn")
         ?.addEventListener(
-            "submit",
-            saveCapitalFromForm
+            "click",
+            saveCapitalFromModal
         );
 
+    $("cancelCapitalBtn")
+        ?.addEventListener(
+            "click",
+            closeCapitalModal
+        );
+
+    $("closeCapitalModal")
+        ?.addEventListener(
+            "click",
+            closeCapitalModal
+        );
 
     [
         "capitalAmountInput",
         "capitalRiskInput",
         "capitalRRInput"
-    ].forEach(
-        id => {
+    ].forEach(id => {
 
-            document
-                .getElementById(id)
-                ?.addEventListener(
-                    "input",
-                    updateCapitalPreview
-                );
-        }
-    );
+        $(id)?.addEventListener(
+            "input",
+            updateCapitalModalPreview
+        );
+    });
 
 
-    document
-        .getElementById(
-            "cancelCapitalBtn"
-        )
+    /* Archive chart */
+
+    $("closeArchiveChartModal")
         ?.addEventListener(
             "click",
-            closeCapitalModal
+            closeArchiveChart
         );
 
-
-    document
-        .getElementById(
-            "closeCapitalModalBtn"
-        )
+    $("archiveChartCloseBtn")
         ?.addEventListener(
             "click",
-            closeCapitalModal
+            closeArchiveChart
         );
 
-
-    document
-        .getElementById(
-            "openTradeModalBtn"
-        )
+    $("archiveChartModal")
         ?.addEventListener(
             "click",
-            openTradeModal
-        );
+            event => {
 
-
-    document
-        .getElementById(
-            "cancelTradeBtn"
-        )
-        ?.addEventListener(
-            "click",
-            closeTradeModal
-        );
-
-
-    document
-        .getElementById(
-            "closeTradeModalBtn"
-        )
-        ?.addEventListener(
-            "click",
-            closeTradeModal
-        );
-
-
-    document
-        .getElementById(
-            "tradeForm"
-        )
-        ?.addEventListener(
-            "submit",
-            saveTrade
-        );
-
-
-    [
-        "tradeEntry",
-        "tradeSL",
-        "tradeDirection"
-    ].forEach(
-        id => {
-
-            document
-                .getElementById(id)
-                ?.addEventListener(
-                    "input",
-                    updateAutomaticTradeValues
-                );
-
-            document
-                .getElementById(id)
-                ?.addEventListener(
-                    "change",
-                    updateAutomaticTradeValues
-                );
-        }
-    );
-
-
-    document
-        .querySelectorAll(
-            'input[name="tradeResult"]'
-        )
-        .forEach(
-            radio => {
-
-                radio.addEventListener(
-                    "change",
-                    updateAutomaticTradeValues
-                );
+                if (
+                    event.target ===
+                    $("archiveChartModal")
+                ) {
+                    closeArchiveChart();
+                }
             }
         );
+}
 
 
-    document
-        .querySelectorAll(
-            "[data-period]"
-        )
-        .forEach(
-            button => {
+/* ============================================================
+   CLEAR HISTORY
+   ============================================================ */
 
-                button.addEventListener(
-                    "click",
-                    () => {
+function initializeClearButton() {
 
-                        currentAnalysisPeriod =
-                            button.dataset.period;
-
-                        updatePeriodButtons();
-
-                        renderAnalysis();
-                    }
-                );
-            }
-        );
-
-
-    document
-        .querySelectorAll(
-            "[data-performance-period]"
-        )
-        .forEach(
-            button => {
-
-                button.addEventListener(
-                    "click",
-                    () => {
-
-                        currentPerformancePeriod =
-                            button.dataset
-                                .performancePeriod;
-
-                        updatePeriodButtons();
-
-                        renderPerformance();
-                    }
-                );
-            }
-        );
-
-
-    document.addEventListener(
-        "click",
-        event => {
-
-            const deleteTradeButton =
-                event.target.closest(
-                    "[data-delete-trade]"
-                );
-
-
-            if (deleteTradeButton) {
-
-                deleteTrade(
-                    deleteTradeButton.dataset
-                        .deleteTrade
-                );
-
-                return;
-            }
-
-
-            const viewArchiveButton =
-                event.target.closest(
-                    "[data-view-archive]"
-                );
-
-
-            if (viewArchiveButton) {
-
-                openArchiveChart(
-                    viewArchiveButton.dataset
-                        .viewArchive
-                );
-
-                return;
-            }
-
-
-            const deleteArchiveButton =
-                event.target.closest(
-                    "[data-delete-archive]"
-                );
-
-
-            if (deleteArchiveButton) {
-
-                deleteArchive(
-                    deleteArchiveButton.dataset
-                        .deleteArchive
-                );
-            }
-        }
-    );
-
-
-    document
-        .getElementById(
-            "clearBtn"
-        )
+    $("clearBtn")
         ?.addEventListener(
             "click",
             () => {
 
-                if (
-                    getActiveCapitalTrades()
-                        .length === 0
-                ) {
+                const trades =
+                    loadTrades();
+
+                if (!trades.length) {
                     return;
                 }
 
-
                 if (
                     !confirm(
-                        "Supprimer tous les trades du capital actif ?"
+                        "Supprimer tout l'historique des trades ?"
                     )
                 ) {
                     return;
                 }
 
+                /*
+                    On ne supprime que les trades.
+                    Le capital actif est recalculé à son
+                    niveau initial.
+                */
 
-                trades =
-                    trades.filter(
-                        trade =>
-                            trade.capitalId !==
-                            activeCapital?.id
+                saveTrades([]);
+
+                const capital =
+                    loadActiveCapital();
+
+                if (capital) {
+
+                    capital.currentBalance =
+                        Number(
+                            capital.initialCapital
+                        );
+
+                    saveActiveCapital(
+                        capital
                     );
-
-
-                saveTrades();
+                }
 
                 renderAll();
             }
         );
+}
 
 
-    document
-        .getElementById(
-            "closeArchiveChartModalBtn"
-        )
-        ?.addEventListener(
-            "click",
-            closeArchiveChartModal
-        );
+/* ============================================================
+   ESCAPE / CLAVIER
+   ============================================================ */
 
-
-    document
-        .querySelectorAll(
-            ".modal"
-        )
-        .forEach(
-            modal => {
-
-                modal.addEventListener(
-                    "click",
-                    event => {
-
-                        if (
-                            event.target ===
-                            modal
-                        ) {
-
-                            modal.classList.remove(
-                                "show"
-                            );
-
-                            modal.setAttribute(
-                                "aria-hidden",
-                                "true"
-                            );
-
-                            if (
-                                modal.id ===
-                                "tradeModal"
-                            ) {
-                                document.body.classList.remove(
-                                    "trade-modal-open"
-                                );
-                            }
-                        }
-                    }
-                );
-            }
-        );
-
+function initializeKeyboard() {
 
     document.addEventListener(
         "keydown",
@@ -4176,26 +4093,181 @@ function initializeEvents() {
 
             closeTradeModal();
             closeCapitalModal();
-            closeArchiveChartModal();
+            closeArchiveChart();
         }
     );
+}
 
+
+/* ============================================================
+   RENDU GLOBAL
+   ============================================================ */
+
+function renderAll() {
+
+    renderDashboard();
+
+    const activePage =
+        document.querySelector(
+            ".page-section.active"
+        );
+
+    if (
+        activePage?.id ===
+        "pageAnalysis"
+    ) {
+
+        renderAnalysisPage();
+    }
+
+    if (
+        activePage?.id ===
+        "pagePerformance"
+    ) {
+
+        renderPerformancePage();
+    }
+
+    if (
+        activePage?.id ===
+        "pageArchives"
+    ) {
+
+        renderArchives();
+    }
+}
+
+
+/* ============================================================
+   MIGRATION DES ANCIENS TRADES
+   ============================================================ */
+
+function migrateTrades() {
+
+    const trades =
+        loadTrades();
+
+    let changed = false;
+
+    const capital =
+        loadActiveCapital();
+
+    const migrated =
+        trades.map(trade => {
+
+            const result = {
+                ...trade
+            };
+
+            if (!result.id) {
+
+                result.id =
+                    `trade_${Date.now()}_${Math.random()
+                        .toString(36)
+                        .slice(2, 8)}`;
+
+                changed = true;
+            }
+
+            if (
+                !result.recordedAt
+            ) {
+
+                result.recordedAt =
+                    getNowISO();
+
+                changed = true;
+            }
+
+            if (
+                !result.capitalId &&
+                capital
+            ) {
+
+                result.capitalId =
+                    capital.id;
+
+                changed = true;
+            }
+
+            if (
+                !Number.isFinite(
+                    Number(
+                        result.profit
+                    )
+                )
+            ) {
+
+                result.profit = 0;
+
+                changed = true;
+            }
+
+            /*
+                Recalcul du RR si absent.
+            */
+
+            if (
+                !Number.isFinite(
+                    Number(result.rr)
+                )
+            ) {
+
+                const rr =
+                    getTradeTargetRR(
+                        result
+                    );
+
+                if (
+                    Number.isFinite(rr)
+                ) {
+
+                    result.rr = rr;
+
+                    changed = true;
+                }
+            }
+
+            return result;
+        });
+
+    if (changed) {
+        saveTrades(migrated);
+    }
+}
+
+
+/* ============================================================
+   REDIMENSIONNEMENT
+   ============================================================ */
+
+function initializeResize() {
 
     window.addEventListener(
         "resize",
         () => {
 
-            renderDashboard();
-
-            const visibleArchive =
+            const activePage =
                 document.querySelector(
-                    "#archiveChartModal.show"
+                    ".page-section.active"
                 );
 
-            if (visibleArchive) {
+            if (
+                activePage?.id ===
+                "pageDashboard"
+            ) {
+                renderCapitalChart(
+                    loadTrades()
+                );
+            }
+
+            if (
+                activePage?.id ===
+                "pageArchives"
+            ) {
                 /*
-                   Le graphique d'archive est
-                   redessiné à la prochaine ouverture.
+                    Le graphique archive est
+                    redessiné à la prochaine ouverture.
                 */
             }
         }
@@ -4204,46 +4276,125 @@ function initializeEvents() {
 
 
 /* ============================================================
-   INITIALISATION
+   DOM READY
    ============================================================ */
-
-function renderAll() {
-
-    renderDashboard();
-
-    renderArchives();
-
-    renderPerformance();
-
-    if (isAnalysisPage()) {
-        renderAnalysis();
-    }
-
-    updatePeriodButtons();
-}
-
-
-function initializeApp() {
-
-    loadData();
-
-    populateTradeForm();
-
-    initializeTheme();
-
-    initializeEvents();
-
-    /*
-       Si aucun capital n'existe,
-       on garde l'application utilisable
-       sans ouvrir automatiquement la modal.
-    */
-
-    renderAll();
-}
-
 
 document.addEventListener(
     "DOMContentLoaded",
-    initializeApp
+    () => {
+
+        try {
+
+            migrateTrades();
+
+            initializeTheme();
+
+            initializeNavigation();
+
+            initializePeriodButtons();
+
+            initializeModals();
+
+            initializeClearButton();
+
+            initializeKeyboard();
+
+            initializeResize();
+
+            /*
+                Dashboard visible par défaut.
+            */
+
+            const dashboard =
+                $("pageDashboard");
+
+            if (dashboard) {
+
+                document
+                    .querySelectorAll(
+                        ".page-section"
+                    )
+                    .forEach(
+                        page =>
+                            page.classList
+                                .remove(
+                                    "active"
+                                )
+                    );
+
+                dashboard.classList.add(
+                    "active"
+                );
+            }
+
+            renderAll();
+
+        } catch (error) {
+
+            console.error(
+                "Erreur initialisation ARCH TRADING PLAN :",
+                error
+            );
+        }
+    }
 );
+
+
+/* ============================================================
+   EXPORTS GLOBAUX
+   Nécessaires pour v51-filters.js
+   ============================================================ */
+
+window.ASSETS = ASSETS;
+window.SETUPS = SETUPS;
+
+window.MIN_RR = MIN_RR;
+window.MIN_LOT = MIN_LOT;
+window.LOT_STEP = LOT_STEP;
+window.RISK_TOLERANCE = RISK_TOLERANCE;
+
+window.formatMoney = formatMoney;
+window.formatPercent = formatPercent;
+window.escapeValue = escapeValue;
+
+window.getTradeRiskDistance =
+    getTradeRiskDistance;
+
+window.calculateTP =
+    calculateTP;
+
+window.getTradeTargetRR =
+    getTradeTargetRR;
+
+window.calculateRiskMoney =
+    calculateRiskMoney;
+
+window.calculateLotFromRisk =
+    calculateLotFromRisk;
+
+window.calculateTradeProfit =
+    calculateTradeProfit;
+
+window.calculatePips =
+    calculatePips;
+
+window.calculateAdvancedStats =
+    calculateAdvancedStats;
+
+window.calculateRiskStats =
+    calculateRiskStats;
+
+window.calculateSetupRanking =
+    calculateSetupRanking;
+
+window.isAnalysisPage =
+    isAnalysisPage;
+
+window.getCalendarTrades =
+    getCalendarTrades;
+
+window.calendarMonth =
+    calendarMonth;
+
+window.calendarYear =
+    calendarYear;
